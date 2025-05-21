@@ -790,7 +790,6 @@ static int mtk_mac_finish(struct phylink_config *config, unsigned int mode,
 
 	return 0;
 }
-
 static void mtk_mac_link_down(struct phylink_config *config, unsigned int mode,
 			      phy_interface_t interface)
 {
@@ -1582,7 +1581,6 @@ static void setup_tx_buf(struct mtk_eth *eth, struct mtk_tx_buf *tx_buf,
 		}
 	}
 }
-
 static void mtk_tx_set_dma_desc_v1(struct net_device *dev, void *txd,
 				   struct mtk_tx_dma_desc_info *info)
 {
@@ -2260,7 +2258,6 @@ out:
 
 	return act;
 }
-
 static int mtk_poll_rx(struct napi_struct *napi, int budget,
 		       struct mtk_eth *eth)
 {
@@ -3041,7 +3038,6 @@ static void mtk_rx_clean(struct mtk_eth *eth, struct mtk_rx_ring *ring, bool in_
 		ring->page_pool = NULL;
 	}
 }
-
 static int mtk_hwlro_rx_init(struct mtk_eth *eth)
 {
 	const struct mtk_reg_map *reg_map = eth->soc->reg_map;
@@ -3826,7 +3822,6 @@ static void mtk_poll_controller(struct net_device *dev)
 	mtk_rx_irq_enable(eth, MTK_RX_DONE_INT(0));
 }
 #endif
-
 static int mtk_start_dma(struct mtk_eth *eth)
 {
 	u32 val, rx_2b_offset = (NET_IP_ALIGN == 2) ? MTK_RX_2B_OFFSET : 0;
@@ -4575,7 +4570,6 @@ static int mtk_napi_init(struct mtk_eth *eth)
 
 	return 0;
 }
-
 static int mtk_hw_init(struct mtk_eth *eth, bool reset)
 {
 	u32 dma_mask = ETHSYS_DMA_AG_MAP_PDMA | ETHSYS_DMA_AG_MAP_QDMA |
@@ -5354,7 +5348,6 @@ static const struct net_device_ops mtk_netdev_ops = {
 	.ndo_xdp_xmit		= mtk_xdp_xmit,
 	.ndo_select_queue	= mtk_select_queue,
 };
-
 static void mux_poll(struct work_struct *work)
 {
 	struct mtk_mux *mux = container_of(work, struct mtk_mux, poll.work);
@@ -5894,7 +5887,6 @@ static int mtk_setup_legacy_sram(struct mtk_eth *eth, struct resource *res)
 				 res->start + MTK_ETH_SRAM_OFFSET,
 				 MTK_ETH_NETSYS_V2_SRAM_SIZE, NUMA_NO_NODE);
 }
-
 static int mtk_probe(struct platform_device *pdev)
 {
 	struct resource *res = NULL;
