@@ -680,7 +680,11 @@
 #define MTK_FE_IRQ_SHARED	0
 #define MTK_FE_IRQ_TX		0
 #define MTK_FE_IRQ_RX		1
-#define MTK_FE_IRQ_NUM		(MTK_FE_IRQ_RX + 1)
+#define MTK_FE_IRQ_RX_RSS0	2
+#define MTK_FE_IRQ_RX_RSS1	3
+#define MTK_FE_IRQ_RX_RSS2	4
+#define MTK_FE_IRQ_RX_RSS3	5
+#define MTK_FE_IRQ_NUM		6
 
 #define MTK_STAT_OFFSET		0x40
 #define MTK_STAT_OFFSET_V3	0x80
@@ -994,6 +998,25 @@ struct mtk_tx_ring {
 	int cpu_idx;
 };
 
+/* struct mtk_rss_ring - RSS ring structure for multiple interrupt handling
+ * @napi:		NAPI structure for this RSS ring
+ * @rx_ring:		Pointer to the associated RX ring
+ * @irq:		Interrupt number for this RSS ring
+ * @ring_id:		Ring identifier (0-3)
+ * @events:		Event counter for this ring
+ * @packets:		Packet counter for this ring
+ * @bytes:		Byte counter for this ring
+ */
+ struct mtk_rss_ring {
+	struct napi_struct	napi;
+	struct mtk_rx_ring	*rx_ring;
+	int			irq;
+	int			ring_id;
+	u32			events;
+	u32			packets;
+	u32			bytes;
+};
+
 /* PDMA rx ring mode */
 enum mtk_rx_flags {
 	MTK_RX_FLAGS_NORMAL = 0,
@@ -1216,7 +1239,7 @@ enum mkt_eth_capabilities {
 		      MTK_GMAC3_SGMII | MTK_GMAC3_USXGMII | \
 		      MTK_MUX_GMAC123_TO_GEPHY_SGMII | \
 		      MTK_MUX_GMAC123_TO_USXGMII | MTK_MUX_GMAC2_TO_2P5GPHY | \
-		      MTK_QDMA | MTK_RSTCTRL_PPE1 | MTK_RSTCTRL_PPE2 | MTK_SRAM)
+		      MTK_QDMA | MTK_RSS | MTK_RSTCTRL_PPE1 | MTK_RSTCTRL_PPE2 | MTK_SRAM)
 
 struct mtk_tx_dma_desc_info {
 	dma_addr_t	addr;
@@ -1406,6 +1429,10 @@ struct mtk_eth {
 	struct mtk_rx_ring		rx_ring_qdma;
 	struct napi_struct		tx_napi;
 	struct napi_struct		rx_napi;
+	struct napi_struct		rss_napi[MTK_MAX_RX_RING_NUM];
+	struct mtk_rss_ring		rss_rings[MTK_MAX_RX_RING_NUM];
+	bool				rss_enabled;
+	int				rss_ring_count;
 	void				*scratch_ring;
 	dma_addr_t			phy_scratch_ring;
 	void				*scratch_head[MTK_FQ_DMA_HEAD];

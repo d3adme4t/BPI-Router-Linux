@@ -2686,6 +2686,44 @@ static int mtk_napi_tx(struct napi_struct *napi, int budget)
 	return tx_done;
 }
 
+/* RSS NAPI poll function for individual RSS rings */
+static int mtk_napi_rss(struct napi_struct *napi, int budget)
+{
+	struct mtk_rss_ring *rss_ring = container_of(napi, struct mtk_rss_ring, napi);
+	struct mtk_eth *eth = container_of(rss_ring, struct mtk_eth, 
+					  rss_rings[rss_ring->ring_id]);
+	const struct mtk_reg_map *reg_map = eth->soc->reg_map;
+	int rx_done = 0;
+
+	/* Process packets from this specific RSS ring */
+	rx_done = mtk_rx_ring_poll(eth, rss_ring->rx_ring, budget);
+	
+	/* Update statistics */
+	rss_ring->packets += rx_done;
+	
+	if (rx_done < budget) {
+		napi_complete_done(napi, rx_done);
+		mtk_rx_irq_enable(eth, eth->soc->rx.irq_done_mask);
+	}
+
+	return rx_done;
+}
+
+/* Helper function to poll a specific RX ring */
+static int mtk_rx_ring_poll(struct mtk_eth *eth, struct mtk_rx_ring *ring, int budget)
+{s
+	const struct mtk_reg_map *reg_map = eth->soc->reg_map;
+	int rx_done = 0;
+
+	/* Use existing RX processing logic but for specific ring */
+	if (ring) {
+		/* Process packets from this specific ring */
+		rx_done = mtk_rx_poll_ring(eth, ring, budget);
+	}
+
+	return rx_done;
+}
+
 static int mtk_napi_rx(struct napi_struct *napi, int budget)
 {
 	struct mtk_eth *eth = container_of(napi, struct mtk_eth, rx_napi);
@@ -3423,6 +3461,8 @@ static bool mtk_hw_reset_check(struct mtk_eth *eth)
 	       (val & MTK_FE_INT_TSO_ALIGN) || (val & MTK_FE_INT_TSO_ILLEGAL);
 }
 
+
+
 static void mtk_tx_timeout(struct net_device *dev, unsigned int txqueue)
 {
 	struct mtk_mac *mac = netdev_priv(dev);
@@ -3447,6 +3487,15 @@ static int mtk_get_irqs(struct platform_device *pdev, struct mtk_eth *eth)
 	/* future SoCs beginning with MT7988 should use named IRQs in dts */
 	eth->irq[MTK_FE_IRQ_TX] = platform_get_irq_byname_optional(pdev, "fe1");
 	eth->irq[MTK_FE_IRQ_RX] = platform_get_irq_byname_optional(pdev, "fe2");
+
+	/* Get RSS interrupts if RSS is supported */
+	if (MTK_HAS_CAPS(eth->soc->caps, MTK_RSS)) {
+		eth->irq[MTK_FE_IRQ_RX_RSS0] = platform_get_irq_byname_optional(pdev, "fe0");
+		eth->irq[MTK_FE_IRQ_RX_RSS1] = platform_get_irq_byname_optional(pdev, "fe3");
+		eth->irq[MTK_FE_IRQ_RX_RSS2] = platform_get_irq_byname_optional(pdev, "pdma1");
+		eth->irq[MTK_FE_IRQ_RX_RSS3] = platform_get_irq_byname_optional(pdev, "pdma2");
+	}
+
 	if (eth->irq[MTK_FE_IRQ_TX] >= 0 && eth->irq[MTK_FE_IRQ_RX] >= 0)
 		return 0;
 
@@ -3508,6 +3557,22 @@ static irqreturn_t mtk_handle_irq_tx(int irq, void *_eth)
 	if (likely(napi_schedule_prep(&eth->tx_napi))) {
 		mtk_tx_irq_disable(eth, MTK_TX_DONE_INT);
 		__napi_schedule(&eth->tx_napi);
+	}
+
+	return IRQ_HANDLED;
+}
+
+/* RSS interrupt handler for individual RSS rings */
+static irqreturn_t mtk_handle_irq_rss(int irq, void *_rss_ring)
+{
+	struct mtk_rss_ring *rss_ring = _rss_ring;
+	struct mtk_eth *eth = container_of(rss_ring, struct mtk_eth, 
+					  rss_rings[rss_ring->ring_id]);
+
+	rss_ring->events++;
+	if (likely(napi_schedule_prep(&rss_ring->napi))) {
+		mtk_rx_irq_disable(eth, eth->soc->rx.irq_done_mask);
+		__napi_schedule(&rss_ring->napi);
 	}
 
 	return IRQ_HANDLED;
@@ -5446,6 +5511,44 @@ static int mtk_setup_legacy_sram(struct mtk_eth *eth, struct resource *res)
 				 res->start + MTK_ETH_SRAM_OFFSET,
 				 MTK_ETH_NETSYS_V2_SRAM_SIZE, NUMA_NO_NODE);
 }
+
+/* Initialize RSS functionality */
+static int mtk_rss_init(struct mtk_eth *eth)
+{
+	int i, ret;
+
+	/* Only initialize RSS if supported */
+	if (!MTK_HAS_CAPS(eth->soc->caps, MTK_RSS))
+		return 0;
+
+	eth->rss_enabled = true;
+	eth->rss_ring_count = MTK_MAX_RX_RING_NUM;
+
+	/* Initialize each RSS ring */
+	for (i = 0; i < eth->rss_ring_count; i++) {
+		struct mtk_rss_ring *rss_ring = &eth->rss_rings[i];
+		
+		rss_ring->ring_id = i;
+		rss_ring->rx_ring = &eth->rx_ring[i];
+		rss_ring->irq = eth->irq[MTK_FE_IRQ_RX_RSS0 + i];
+		
+		/* Initialize NAPI for this RSS ring */
+		netif_napi_add(eth->dummy_dev, &rss_ring->napi, mtk_napi_rss, 64);
+		
+		/* Request interrupt for this RSS ring */
+		ret = devm_request_irq(eth->dev, rss_ring->irq, mtk_handle_irq_rss,
+				      IRQF_SHARED, dev_name(eth->dev), rss_ring);
+		if (ret) {
+			dev_err(eth->dev, "failed to request RSS IRQ %d\n", i);
+			return ret;
+		}
+	}
+
+	dev_info(eth->dev, "RSS initialized with %d rings\n", eth->rss_ring_count);
+	return 0;
+}
+
+static int mtk_probe(struct platform_device *pdev)
 
 static int mtk_probe(struct platform_device *pdev)
 {
