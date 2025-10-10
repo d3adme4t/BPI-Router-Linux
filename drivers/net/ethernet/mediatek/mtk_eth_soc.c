@@ -3493,8 +3493,8 @@ static int mtk_get_irqs(struct platform_device *pdev, struct mtk_eth *eth)
 
 	/* Get RSS interrupts if RSS is supported */
 	if (MTK_HAS_CAPS(eth->soc->caps, MTK_RSS)) {
-		eth->irq[MTK_FE_IRQ_RX_RSS0] = platform_get_irq_byname_optional(pdev, "fe0");
-		eth->irq[MTK_FE_IRQ_RX_RSS1] = platform_get_irq_byname_optional(pdev, "fe3");
+		eth->irq[MTK_FE_IRQ_RX_RSS0] = platform_get_irq_byname_optional(pdev, "fe3");
+		eth->irq[MTK_FE_IRQ_RX_RSS1] = platform_get_irq_byname_optional(pdev, "pdma0");
 		eth->irq[MTK_FE_IRQ_RX_RSS2] = platform_get_irq_byname_optional(pdev, "pdma1");
 		eth->irq[MTK_FE_IRQ_RX_RSS3] = platform_get_irq_byname_optional(pdev, "pdma2");
 	}
