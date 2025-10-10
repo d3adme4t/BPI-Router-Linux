@@ -35,6 +35,9 @@
 #include "mtk_eth_soc.h"
 #include "mtk_wed.h"
 
+/* Forward declarations */
+static int mtk_rx_ring_poll(struct mtk_eth *eth, struct mtk_rx_ring *ring, int budget);
+
 static int mtk_msg_level = -1;
 module_param_named(msg_level, mtk_msg_level, int, 0);
 MODULE_PARM_DESC(msg_level, "Message level (-1=defaults,0=none,...,16=all)");
@@ -2692,7 +2695,6 @@ static int mtk_napi_rss(struct napi_struct *napi, int budget)
 	struct mtk_rss_ring *rss_ring = container_of(napi, struct mtk_rss_ring, napi);
 	struct mtk_eth *eth = container_of(rss_ring, struct mtk_eth, 
 					  rss_rings[rss_ring->ring_id]);
-	const struct mtk_reg_map *reg_map = eth->soc->reg_map;
 	int rx_done = 0;
 
 	/* Process packets from this specific RSS ring */
@@ -2711,14 +2713,15 @@ static int mtk_napi_rss(struct napi_struct *napi, int budget)
 
 /* Helper function to poll a specific RX ring */
 static int mtk_rx_ring_poll(struct mtk_eth *eth, struct mtk_rx_ring *ring, int budget)
-{s
-	const struct mtk_reg_map *reg_map = eth->soc->reg_map;
+{
 	int rx_done = 0;
 
 	/* Use existing RX processing logic but for specific ring */
 	if (ring) {
-		/* Process packets from this specific ring */
-		rx_done = mtk_rx_poll_ring(eth, ring, budget);
+		/* For now, use the main RX poll function with dummy napi */
+		/* TODO: Implement ring-specific polling */
+		struct napi_struct dummy_napi = {};
+		rx_done = mtk_poll_rx(&dummy_napi, budget, eth);
 	}
 
 	return rx_done;
@@ -5533,7 +5536,7 @@ static int mtk_rss_init(struct mtk_eth *eth)
 		rss_ring->irq = eth->irq[MTK_FE_IRQ_RX_RSS0 + i];
 		
 		/* Initialize NAPI for this RSS ring */
-		netif_napi_add(eth->dummy_dev, &rss_ring->napi, mtk_napi_rss, 64);
+		netif_napi_add(eth->dummy_dev, &rss_ring->napi, mtk_napi_rss);
 		
 		/* Request interrupt for this RSS ring */
 		ret = devm_request_irq(eth->dev, rss_ring->irq, mtk_handle_irq_rss,
@@ -5547,8 +5550,6 @@ static int mtk_rss_init(struct mtk_eth *eth)
 	dev_info(eth->dev, "RSS initialized with %d rings\n", eth->rss_ring_count);
 	return 0;
 }
-
-static int mtk_probe(struct platform_device *pdev)
 
 static int mtk_probe(struct platform_device *pdev)
 {
@@ -5824,6 +5825,11 @@ static int mtk_probe(struct platform_device *pdev)
 	}
 	netif_napi_add(eth->dummy_dev, &eth->tx_napi, mtk_napi_tx);
 	netif_napi_add(eth->dummy_dev, &eth->rx_napi, mtk_napi_rx);
+
+	/* Initialize RSS if supported */
+	err = mtk_rss_init(eth);
+	if (err)
+		goto err_unreg_netdev;
 
 	platform_set_drvdata(pdev, eth);
 	schedule_delayed_work(&eth->reset.monitor_work,
