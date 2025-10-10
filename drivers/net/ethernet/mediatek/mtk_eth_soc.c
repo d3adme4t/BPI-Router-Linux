@@ -5826,12 +5826,12 @@ static int mtk_probe(struct platform_device *pdev)
 	netif_napi_add(eth->dummy_dev, &eth->tx_napi, mtk_napi_tx);
 	netif_napi_add(eth->dummy_dev, &eth->rx_napi, mtk_napi_rx);
 
-	/* Initialize RSS if supported */
+	platform_set_drvdata(pdev, eth);
+
+	/* Initialize RSS if supported - moved after platform_set_drvdata */
 	err = mtk_rss_init(eth);
 	if (err)
 		goto err_unreg_netdev;
-
-	platform_set_drvdata(pdev, eth);
 	schedule_delayed_work(&eth->reset.monitor_work,
 			      MTK_DMA_MONITOR_TIMEOUT);
 
