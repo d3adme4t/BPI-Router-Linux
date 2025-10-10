@@ -3493,10 +3493,17 @@ static int mtk_get_irqs(struct platform_device *pdev, struct mtk_eth *eth)
 
 	/* Get RSS interrupts if RSS is supported */
 	if (MTK_HAS_CAPS(eth->soc->caps, MTK_RSS)) {
+		dev_info(&pdev->dev, "mtk_get_irqs: RSS supported, getting RSS interrupts\n");
 		eth->irq[MTK_FE_IRQ_RX_RSS0] = platform_get_irq_byname_optional(pdev, "fe3");
 		eth->irq[MTK_FE_IRQ_RX_RSS1] = platform_get_irq_byname_optional(pdev, "pdma0");
 		eth->irq[MTK_FE_IRQ_RX_RSS2] = platform_get_irq_byname_optional(pdev, "pdma1");
 		eth->irq[MTK_FE_IRQ_RX_RSS3] = platform_get_irq_byname_optional(pdev, "pdma2");
+		
+		dev_info(&pdev->dev, "mtk_get_irqs: RSS interrupts - fe3=%d, pdma0=%d, pdma1=%d, pdma2=%d\n",
+			 eth->irq[MTK_FE_IRQ_RX_RSS0], eth->irq[MTK_FE_IRQ_RX_RSS1],
+			 eth->irq[MTK_FE_IRQ_RX_RSS2], eth->irq[MTK_FE_IRQ_RX_RSS3]);
+	} else {
+		dev_info(&pdev->dev, "mtk_get_irqs: RSS not supported by this SoC\n");
 	}
 
 	if (eth->irq[MTK_FE_IRQ_TX] >= 0 && eth->irq[MTK_FE_IRQ_RX] >= 0)
@@ -5520,9 +5527,15 @@ static int mtk_rss_init(struct mtk_eth *eth)
 {
 	int i, ret;
 
+	dev_info(eth->dev, "mtk_rss_init: Starting RSS initialization\n");
+
 	/* Only initialize RSS if supported */
-	if (!MTK_HAS_CAPS(eth->soc->caps, MTK_RSS))
+	if (!MTK_HAS_CAPS(eth->soc->caps, MTK_RSS)) {
+		dev_info(eth->dev, "mtk_rss_init: RSS not supported by this SoC\n");
 		return 0;
+	}
+
+	dev_info(eth->dev, "mtk_rss_init: RSS is supported, initializing %d rings\n", MTK_MAX_RX_RING_NUM);
 
 	eth->rss_enabled = true;
 	eth->rss_ring_count = MTK_MAX_RX_RING_NUM;
@@ -5539,12 +5552,17 @@ static int mtk_rss_init(struct mtk_eth *eth)
 		netif_napi_add(eth->dummy_dev, &rss_ring->napi, mtk_napi_rss);
 		
 		/* Request interrupt for this RSS ring */
+		dev_info(eth->dev, "mtk_rss_init: Requesting RSS IRQ %d (irq=%d) for ring %d\n", 
+			 MTK_FE_IRQ_RX_RSS0 + i, rss_ring->irq, i);
 		ret = devm_request_irq(eth->dev, rss_ring->irq, mtk_handle_irq_rss,
 				      IRQF_SHARED, dev_name(eth->dev), rss_ring);
 		if (ret) {
-			dev_err(eth->dev, "failed to request RSS IRQ %d\n", i);
+			dev_err(eth->dev, "mtk_rss_init: failed to request RSS IRQ %d (irq=%d) for ring %d: %d\n", 
+				MTK_FE_IRQ_RX_RSS0 + i, rss_ring->irq, i, ret);
 			return ret;
 		}
+		dev_info(eth->dev, "mtk_rss_init: Successfully registered RSS IRQ %d for ring %d\n", 
+			 rss_ring->irq, i);
 	}
 
 	dev_info(eth->dev, "RSS initialized with %d rings\n", eth->rss_ring_count);
@@ -5557,6 +5575,8 @@ static int mtk_probe(struct platform_device *pdev)
 	struct device_node *mac_np, *mux_np;
 	struct mtk_eth *eth;
 	int err, i;
+
+	dev_info(&pdev->dev, "mtk_probe: Starting ethernet driver initialization\n");
 
 	eth = devm_kzalloc(&pdev->dev, sizeof(*eth), GFP_KERNEL);
 	if (!eth)
@@ -5826,12 +5846,18 @@ static int mtk_probe(struct platform_device *pdev)
 	netif_napi_add(eth->dummy_dev, &eth->tx_napi, mtk_napi_tx);
 	netif_napi_add(eth->dummy_dev, &eth->rx_napi, mtk_napi_rx);
 
+	dev_info(&pdev->dev, "mtk_probe: Setting platform driver data\n");
 	platform_set_drvdata(pdev, eth);
+	dev_info(&pdev->dev, "mtk_probe: Platform driver data set successfully\n");
 
 	/* Initialize RSS if supported - moved after platform_set_drvdata */
+	dev_info(&pdev->dev, "mtk_probe: Starting RSS initialization\n");
 	err = mtk_rss_init(eth);
-	if (err)
+	if (err) {
+		dev_err(&pdev->dev, "mtk_probe: RSS initialization failed: %d\n", err);
 		goto err_unreg_netdev;
+	}
+	dev_info(&pdev->dev, "mtk_probe: RSS initialization completed successfully\n");
 	schedule_delayed_work(&eth->reset.monitor_work,
 			      MTK_DMA_MONITOR_TIMEOUT);
 
