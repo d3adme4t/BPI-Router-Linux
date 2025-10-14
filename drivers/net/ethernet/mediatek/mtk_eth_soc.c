@@ -37,7 +37,6 @@
 #include "mtk_wed.h"
 
 /* Forward declarations */
-static int mtk_rx_ring_poll(struct mtk_eth *eth, struct mtk_rx_ring *ring, int budget);
 
 static int mtk_msg_level = -1;
 module_param_named(msg_level, mtk_msg_level, int, 0);
@@ -181,6 +180,16 @@ static const struct mtk_reg_map mt7988_reg_map = {
 		.irq_mask	= 0x6a28,
 		.adma_rx_dbg0	= 0x6a38,
 		.int_grp	= 0x6a50,
+		.int_grp3	= 0x6a58,
+		.tx_delay_irq	= 0x6ab0,
+		.rx_delay_irq	= 0x6ac0,
+		.lro_ctrl_dw0	= 0x6c08,
+		.lro_alt_score_delta	= 0x6c1c,
+		.lro_ring_dip_dw0	= 0x6c14,
+		.lro_ring_ctrl_dw1	= 0x6c38,
+		.lro_alt_dbg	= 0x6c40,
+		.lro_alt_dbg_data	= 0x6c44,
+		.rss_glo_cfg	= 0x7000,
 	},
 	.qdma = {
 		.qtx_cfg	= 0x4400,
@@ -1981,7 +1990,7 @@ static struct page_pool *mtk_create_page_pool(struct mtk_eth *eth,
 		return pp;
 
 	err = __xdp_rxq_info_reg(xdp_q, eth->dummy_dev, id,
-				 eth->rx_napi.napi_id, PAGE_SIZE);
+				 eth->rx_napi[0].napi.napi_id, PAGE_SIZE);
 	if (err < 0)
 		goto err_free_pp;
 
@@ -2690,47 +2699,12 @@ static int mtk_napi_tx(struct napi_struct *napi, int budget)
 	return tx_done;
 }
 
-/* RSS NAPI poll function for individual RSS rings */
-static int mtk_napi_rss(struct napi_struct *napi, int budget)
-{
-	struct mtk_rss_ring *rss_ring = container_of(napi, struct mtk_rss_ring, napi);
-	struct mtk_eth *eth = container_of(rss_ring, struct mtk_eth, 
-					  rss_rings[rss_ring->ring_id]);
-	int rx_done = 0;
 
-	/* Process packets from this specific RSS ring */
-	rx_done = mtk_rx_ring_poll(eth, rss_ring->rx_ring, budget);
-	
-	/* Update statistics */
-	rss_ring->packets += rx_done;
-	
-	if (rx_done < budget) {
-		napi_complete_done(napi, rx_done);
-		mtk_rx_irq_enable(eth, eth->soc->rx.irq_done_mask);
-	}
-
-	return rx_done;
-}
-
-/* Helper function to poll a specific RX ring */
-static int mtk_rx_ring_poll(struct mtk_eth *eth, struct mtk_rx_ring *ring, int budget)
-{
-	int rx_done = 0;
-
-	/* Use existing RX processing logic but for specific ring */
-	if (ring) {
-		/* For now, use the main RX poll function with dummy napi */
-		/* TODO: Implement ring-specific polling */
-		struct napi_struct dummy_napi = {};
-		rx_done = mtk_poll_rx(&dummy_napi, budget, eth);
-	}
-
-	return rx_done;
-}
 
 static int mtk_napi_rx(struct napi_struct *napi, int budget)
 {
-	struct mtk_eth *eth = container_of(napi, struct mtk_eth, rx_napi);
+	struct mtk_napi *rx_napi = container_of(napi, struct mtk_napi, napi);
+	struct mtk_eth *eth = rx_napi->eth;
 	const struct mtk_reg_map *reg_map = eth->soc->reg_map;
 	int rx_done_total = 0;
 
@@ -3484,40 +3458,26 @@ static void mtk_tx_timeout(struct net_device *dev, unsigned int txqueue)
 	schedule_work(&eth->pending_work);
 }
 
-static int mtk_get_irqs(struct platform_device *pdev, struct mtk_eth *eth)
+static int mtk_get_irqs_fe(struct platform_device *pdev, struct mtk_eth *eth)
 {
 	int i;
 
 	/* future SoCs beginning with MT7988 should use named IRQs in dts */
-	eth->irq[MTK_FE_IRQ_TX] = platform_get_irq_byname_optional(pdev, "fe1");
-	eth->irq[MTK_FE_IRQ_RX] = platform_get_irq_byname_optional(pdev, "fe2");
+	eth->irq_fe[MTK_FE_IRQ_TX] = platform_get_irq_byname_optional(pdev, "fe1");
+	eth->irq_fe[MTK_FE_IRQ_RX] = platform_get_irq_byname_optional(pdev, "fe2");
 
-	/* Get RSS interrupts if RSS is supported */
-	if (MTK_HAS_CAPS(eth->soc->caps, MTK_RSS)) {
-		dev_info(&pdev->dev, "mtk_get_irqs: RSS supported, getting RSS interrupts\n");
-		/* Use all 4 PDMA interrupts for RSS rings - better performance and hardware utilization */
-		eth->irq[MTK_FE_IRQ_RX_RSS0] = platform_get_irq_byname_optional(pdev, "pdma0");
-		eth->irq[MTK_FE_IRQ_RX_RSS1] = platform_get_irq_byname_optional(pdev, "pdma1");
-		eth->irq[MTK_FE_IRQ_RX_RSS2] = platform_get_irq_byname_optional(pdev, "pdma2");
-		eth->irq[MTK_FE_IRQ_RX_RSS3] = platform_get_irq_byname_optional(pdev, "pdma3");
-		
-		dev_info(&pdev->dev, "mtk_get_irqs: RSS interrupts - pdma0=%d, pdma1=%d, pdma2=%d, pdma3=%d\n",
-			 eth->irq[MTK_FE_IRQ_RX_RSS0], eth->irq[MTK_FE_IRQ_RX_RSS1],
-			 eth->irq[MTK_FE_IRQ_RX_RSS2], eth->irq[MTK_FE_IRQ_RX_RSS3]);
-	} else {
-		dev_info(&pdev->dev, "mtk_get_irqs: RSS not supported by this SoC\n");
-	}
+	/* RSS interrupts are handled separately in 6.16-rsslro approach */
 
-	if (eth->irq[MTK_FE_IRQ_TX] >= 0 && eth->irq[MTK_FE_IRQ_RX] >= 0)
+	if (eth->irq_fe[MTK_FE_IRQ_TX] >= 0 && eth->irq_fe[MTK_FE_IRQ_RX] >= 0)
 		return 0;
 
 	/* only use legacy mode if platform_get_irq_byname_optional returned -ENXIO */
-	if (eth->irq[MTK_FE_IRQ_TX] != -ENXIO)
-		return dev_err_probe(&pdev->dev, eth->irq[MTK_FE_IRQ_TX],
+	if (eth->irq_fe[MTK_FE_IRQ_TX] != -ENXIO)
+		return dev_err_probe(&pdev->dev, eth->irq_fe[MTK_FE_IRQ_TX],
 				     "Error requesting FE TX IRQ\n");
 
-	if (eth->irq[MTK_FE_IRQ_RX] != -ENXIO)
-		return dev_err_probe(&pdev->dev, eth->irq[MTK_FE_IRQ_RX],
+	if (eth->irq_fe[MTK_FE_IRQ_RX] != -ENXIO)
+		return dev_err_probe(&pdev->dev, eth->irq_fe[MTK_FE_IRQ_RX],
 				     "Error requesting FE RX IRQ\n");
 
 	if (!MTK_HAS_CAPS(eth->soc->caps, MTK_SHARED_INT))
@@ -3532,14 +3492,14 @@ static int mtk_get_irqs(struct platform_device *pdev, struct mtk_eth *eth)
 	for (i = 0; i < MTK_FE_IRQ_NUM; i++) {
 		if (MTK_HAS_CAPS(eth->soc->caps, MTK_SHARED_INT)) {
 			if (i == MTK_FE_IRQ_SHARED)
-				eth->irq[MTK_FE_IRQ_SHARED] = platform_get_irq(pdev, i);
+				eth->irq_fe[MTK_FE_IRQ_SHARED] = platform_get_irq(pdev, i);
 			else
-				eth->irq[i] = eth->irq[MTK_FE_IRQ_SHARED];
+				eth->irq_fe[i] = eth->irq_fe[MTK_FE_IRQ_SHARED];
 		} else {
-			eth->irq[i] = platform_get_irq(pdev, i + 1);
+			eth->irq_fe[i] = platform_get_irq(pdev, i + 1);
 		}
 
-		if (eth->irq[i] < 0) {
+		if (eth->irq_fe[i] < 0) {
 			dev_err(&pdev->dev, "no IRQ%d resource found\n", i);
 			return -ENXIO;
 		}
@@ -3548,14 +3508,41 @@ static int mtk_get_irqs(struct platform_device *pdev, struct mtk_eth *eth)
 	return 0;
 }
 
-static irqreturn_t mtk_handle_irq_rx(int irq, void *_eth)
+static int mtk_get_irqs_pdma(struct platform_device *pdev, struct mtk_eth *eth)
 {
-	struct mtk_eth *eth = _eth;
+	char *rxring = "pdma0";
+	int i;
+
+	for (i = 0; i < MTK_PDMA_IRQ_NUM; i++) {
+		rxring[4] = '0' + i;
+		eth->irq_pdma[i] = platform_get_irq_byname(pdev, rxring);
+		if (eth->irq_pdma[i] < 0)
+			return eth->irq_pdma[i];
+	}
+
+	return 0;
+}
+
+static bool mtk_rss_available(struct mtk_eth *eth)
+{
+	return MTK_HAS_CAPS(eth->soc->caps, MTK_RSS) || eth->hwlro;
+}
+
+static irqreturn_t mtk_handle_irq_rx(int irq, void *priv)
+{
+	struct mtk_napi *rx_napi = priv;
+	struct mtk_eth *eth = rx_napi->eth;
+	struct mtk_rx_ring *ring = rx_napi->rx_ring;
 
 	eth->rx_events++;
-	if (likely(napi_schedule_prep(&eth->rx_napi))) {
-		mtk_rx_irq_disable(eth, eth->soc->rx.irq_done_mask);
-		__napi_schedule(&eth->rx_napi);
+	if (unlikely(!(mtk_r32(eth, eth->soc->reg_map->pdma.irq_status) &
+		       mtk_r32(eth, eth->soc->reg_map->pdma.irq_mask) &
+		       MTK_RX_DONE_INT(ring->ring_no))))
+		return IRQ_NONE;
+
+	if (likely(napi_schedule_prep(&rx_napi->napi))) {
+		mtk_rx_irq_disable(eth, MTK_RX_DONE_INT(ring->ring_no));
+		__napi_schedule(&rx_napi->napi);
 	}
 
 	return IRQ_HANDLED;
@@ -3574,21 +3561,6 @@ static irqreturn_t mtk_handle_irq_tx(int irq, void *_eth)
 	return IRQ_HANDLED;
 }
 
-/* RSS interrupt handler for individual RSS rings */
-static irqreturn_t mtk_handle_irq_rss(int irq, void *_rss_ring)
-{
-	struct mtk_rss_ring *rss_ring = _rss_ring;
-	struct mtk_eth *eth = container_of(rss_ring, struct mtk_eth, 
-					  rss_rings[rss_ring->ring_id]);
-
-	rss_ring->events++;
-	if (likely(napi_schedule_prep(&rss_ring->napi))) {
-		mtk_rx_irq_disable(eth, eth->soc->rx.irq_done_mask);
-		__napi_schedule(&rss_ring->napi);
-	}
-
-	return IRQ_HANDLED;
-}
 
 static irqreturn_t mtk_handle_irq(int irq, void *_eth)
 {
@@ -3617,7 +3589,7 @@ static void mtk_poll_controller(struct net_device *dev)
 
 	mtk_tx_irq_disable(eth, MTK_TX_DONE_INT);
 	mtk_rx_irq_disable(eth, eth->soc->rx.irq_done_mask);
-	mtk_handle_irq_rx(eth->irq[MTK_FE_IRQ_RX], dev);
+	mtk_handle_irq_rx(eth->irq_fe[MTK_FE_IRQ_RX], dev);letc complete all unfinished things - lets do as close as possible to rsslro
 	mtk_tx_irq_enable(eth, MTK_TX_DONE_INT);
 	mtk_rx_irq_enable(eth, eth->soc->rx.irq_done_mask);
 }
@@ -3791,7 +3763,7 @@ static int mtk_open(struct net_device *dev)
 		}
 
 		napi_enable(&eth->tx_napi);
-		napi_enable(&eth->rx_napi);
+		napi_enable(&eth->rx_napi[0].napi);
 		mtk_tx_irq_enable(eth, MTK_TX_DONE_INT);
 		mtk_rx_irq_enable(eth, soc->rx.irq_done_mask);
 		refcount_set(&eth->dma_refcnt, 1);
@@ -3880,7 +3852,7 @@ static int mtk_stop(struct net_device *dev)
 	mtk_tx_irq_disable(eth, MTK_TX_DONE_INT);
 	mtk_rx_irq_disable(eth, eth->soc->rx.irq_done_mask);
 	napi_disable(&eth->tx_napi);
-	napi_disable(&eth->rx_napi);
+	napi_disable(&eth->rx_napi[0].napi);
 
 	cancel_work_sync(&eth->rx_dim.work);
 	cancel_work_sync(&eth->tx_dim.work);
@@ -4295,6 +4267,33 @@ static void mtk_hw_reset_monitor_work(struct work_struct *work)
 out:
 	schedule_delayed_work(&eth->reset.monitor_work,
 			      MTK_DMA_MONITOR_TIMEOUT);
+}
+
+static int mtk_napi_init(struct mtk_eth *eth)
+{
+	struct mtk_napi *rx_napi = &eth->rx_napi[0];
+	int i;
+
+	rx_napi->eth = eth;
+	rx_napi->rx_ring = &eth->rx_ring[0];
+
+	if (MTK_HAS_CAPS(eth->soc->caps, MTK_RSS)) {
+		for (i = 1; i < MTK_RX_RSS_NUM; i++) {
+			rx_napi = &eth->rx_napi[MTK_RSS_RING(i)];
+			rx_napi->eth = eth;
+			rx_napi->rx_ring = &eth->rx_ring[MTK_RSS_RING(i)];
+		}
+	}
+
+	if (eth->hwlro) {
+		for (i = 0; i < MTK_HW_LRO_RING_NUM; i++) {
+			rx_napi = &eth->rx_napi[MTK_HW_LRO_RING(i)];
+			rx_napi->eth = eth;
+			rx_napi->rx_ring = &eth->rx_ring[MTK_HW_LRO_RING(i)];
+		}
+	}
+
+	return 0;
 }
 
 static int mtk_hw_init(struct mtk_eth *eth, bool reset)
@@ -5401,7 +5400,7 @@ no_pcs:
 	eth->netdev[id]->features |= eth->soc->hw_features;
 	eth->netdev[id]->ethtool_ops = &mtk_ethtool_ops;
 
-	eth->netdev[id]->irq = eth->irq[MTK_FE_IRQ_SHARED];
+	eth->netdev[id]->irq = eth->irq_fe[MTK_FE_IRQ_SHARED];
 	eth->netdev[id]->dev.of_node = np;
 
 	phylink = phylink_create(&mac->phylink_config,
@@ -5524,156 +5523,83 @@ static int mtk_setup_legacy_sram(struct mtk_eth *eth, struct resource *res)
 				 MTK_ETH_NETSYS_V2_SRAM_SIZE, NUMA_NO_NODE);
 }
 
-/* Configure RSS hardware registers using safe handshake protocol */
-static int mtk_rss_hw_config(struct mtk_eth *eth)
+/* Helper function to generate indirection table value - from 6.16-rsslro */
+static u32 mtk_rss_indr_table(struct mtk_rss_params *rss_params, int index)
 {
-	/* Standard Toeplitz key from Microsoft RSS specification */
-	static const u32 rss_hash_key[MTK_RSS_HASH_KEY_DW_COUNT] = {
-		0x6d5a56da, 0x255b0ec2, 0x41670961, 0x1e5c2bc4, 0x5229b5a9,
-		0x2d0a9f4b, 0x5f0e3b17, 0x3b2e1b8c, 0x4a3e5729, 0x0d9f1a2c
-	};
-	void __iomem *rss_base;
-	u32 val, i;
-	int ret;
+	u32 val = 0;
+	int i;
 
-	dev_info(eth->dev, "Configuring RSS hardware engine at 0x%x\n", MTK_RSS_BASE);
+	for (i = 16 * index; i < 16 * index + 16; i++)
+		val |= (rss_params->indirection_table[i] << (2 * (i % 16)));
 
-	/* Map RSS register space directly */
-	rss_base = ioremap(MTK_RSS_BASE, 0x1000);
-	if (!rss_base) {
-		dev_err(eth->dev, "Failed to map RSS register space at 0x%x\n", MTK_RSS_BASE);
-		return -ENOMEM;
-	}
-
-	/* Step 1: Wait for hardware to be ready using robust polling */
-	ret = readl_poll_timeout(rss_base, val, (val & MTK_RSS_CFG_RDY), 0, 1000);
-	if (ret) {
-		dev_err(eth->dev, "RSS hardware not ready (CFG_RDY timeout, val=0x%x)\n", val);
-		iounmap(rss_base);
-		return -ETIMEDOUT;
-	}
-
-	dev_info(eth->dev, "RSS hardware ready for configuration (GLO_CFG=0x%x)\n", val);
-
-	/* Step 2: Program 40-byte Toeplitz hash key */
-	for (i = 0; i < MTK_RSS_HASH_KEY_DW_COUNT; i++) {
-		writel(rss_hash_key[i], rss_base + (MTK_RSS_HASH_KEY_DW0 - MTK_RSS_BASE) + (i * 4));
-	}
-	dev_info(eth->dev, "RSS hash key programmed (Toeplitz)\n");
-
-	/* Step 3: Configure indirection table for round-robin distribution */
-	for (i = 0; i < MTK_RSS_INDIR_SIZE / 16; i++) {
-		/* Each DW holds 16 x 2-bit queue indices */
-		u32 table_val = 0;
-		int j;
-		
-		for (j = 0; j < 16; j++) {
-			u32 queue = (i * 16 + j) % MTK_MAX_RX_RING_NUM;
-			table_val |= (queue << (j * 2));
-		}
-		
-		writel(table_val, rss_base + (MTK_RSS_INDR_TABLE_DW0 - MTK_RSS_BASE) + (i * 4));
-	}
-	dev_info(eth->dev, "RSS indirection table configured (%d entries -> %d queues)\n",
-		 MTK_RSS_INDIR_SIZE, MTK_MAX_RX_RING_NUM);
-
-	/* Step 4: Configure global settings */
-	val = readl(rss_base);
-	
-	/* Set indirection table size: 128 entries = log2(128) - 1 = 6 */
-	val &= ~MTK_RSS_INDR_TBL_SIZE_MASK;
-	val |= (6 << MTK_RSS_INDR_TBL_SIZE_SHIFT);
-	
-	/* Enable 4-tuple hashing for IPv4 and IPv6 */
-	val |= MTK_RSS_IPV4_4T_HASH_EN | MTK_RSS_IPV6_4T_HASH_EN;
-	
-	/* Enable RSS */
-	val |= MTK_RSS_ENABLE;
-	
-	/* Write configuration */
-	writel(val, rss_base);
-
-	/* Step 5: Initiate configuration change */
-	val = readl(rss_base);
-	val |= MTK_RSS_CFG_REQ;
-	writel(val, rss_base);
-
-	/* Step 6: Wait for configuration to complete using robust polling */
-	ret = readl_poll_timeout(rss_base, val, !(val & MTK_RSS_CFG_REQ), 0, 1000);
-	if (ret) {
-		dev_err(eth->dev, "RSS configuration change timeout (GLO_CFG=0x%x)\n", val);
-		iounmap(rss_base);
-		return -ETIMEDOUT;
-	}
-
-	/* Step 7: Verify RSS is enabled */
-	val = readl(rss_base);
-	if (!(val & MTK_RSS_ENABLE)) {
-		dev_err(eth->dev, "Failed to enable RSS engine (GLO_CFG=0x%x)\n", val);
-		iounmap(rss_base);
-		return -EIO;
-	}
-
-	dev_info(eth->dev, "RSS hardware enabled successfully (GLO_CFG=0x%x)\n", val);
-	
-	/* Clean up mapping */
-	iounmap(rss_base);
-	return 0;
+	return val;
 }
 
-/* Initialize RSS functionality */
+/* Working RSS initialization from 6.16-rsslro */
 static int mtk_rss_init(struct mtk_eth *eth)
 {
-	int i, ret;
+	const struct mtk_soc_data *soc = eth->soc;
+	const struct mtk_reg_map *reg_map = eth->soc->reg_map;
+	struct mtk_rss_params *rss_params = &eth->rss_params;
+	static u8 hash_key[MTK_RSS_HASH_KEYSIZE] = {
+		0xfa, 0x01, 0xac, 0xbe, 0x3b, 0xb7, 0x42, 0x6a,
+		0x0c, 0xf2, 0x30, 0x80, 0xa3, 0x2d, 0xcb, 0x77,
+		0xb4, 0x30, 0x7b, 0xae, 0xcb, 0x2b, 0xca, 0xd0,
+		0xb0, 0x8f, 0xa3, 0x43, 0x3d, 0x25, 0x67, 0x41,
+		0xc2, 0x0e, 0x5b, 0x25, 0xda, 0x56, 0x5a, 0x6d};
+	u32 val;
+	int i;
 
-	dev_info(eth->dev, "mtk_rss_init: Starting RSS initialization\n");
+	dev_info(eth->dev, "Initializing RSS with %d rings\n", soc->rss_num);
 
-	/* Only initialize RSS if supported */
-	if (!MTK_HAS_CAPS(eth->soc->caps, MTK_RSS)) {
-		dev_info(eth->dev, "mtk_rss_init: RSS not supported by this SoC\n");
-		return 0;
-	}
+	memcpy(rss_params->hash_key, hash_key, MTK_RSS_HASH_KEYSIZE);
 
-	dev_info(eth->dev, "mtk_rss_init: RSS is supported, initializing %d rings\n", MTK_MAX_RX_RING_NUM);
+	for (i = 0; i < MTK_RSS_MAX_INDIRECTION_TABLE; i++)
+		rss_params->indirection_table[i] = i % soc->rss_num;
 
-	/* CRITICAL: Configure hardware BEFORE interrupt registration */
-	ret = mtk_rss_hw_config(eth);
-	if (ret) {
-		dev_err(eth->dev, "RSS hardware configuration failed: %d\n", ret);
-		return ret;
-	}
-
-	eth->rss_enabled = true;
-	eth->rss_ring_count = MTK_MAX_RX_RING_NUM;
-
-	/* Initialize each RSS ring */
-	for (i = 0; i < eth->rss_ring_count; i++) {
-		struct mtk_rss_ring *rss_ring = &eth->rss_rings[i];
-		
-		rss_ring->ring_id = i;
-		rss_ring->rx_ring = &eth->rx_ring[i];
-		rss_ring->irq = eth->irq[MTK_FE_IRQ_RX_RSS0 + i];
-		
-		/* Initialize NAPI for this RSS ring */
-		netif_napi_add(eth->dummy_dev, &rss_ring->napi, mtk_napi_rss);
-		
-		/* Request interrupt for this RSS ring */
-		dev_info(eth->dev, "mtk_rss_init: Requesting RSS IRQ %d (irq=%d) for ring %d\n", 
-			 MTK_FE_IRQ_RX_RSS0 + i, rss_ring->irq, i);
-		ret = devm_request_irq(eth->dev, rss_ring->irq, mtk_handle_irq_rss,
-				      IRQF_SHARED, dev_name(eth->dev), rss_ring);
-		if (ret) {
-			dev_err(eth->dev, "mtk_rss_init: failed to request RSS IRQ %d (irq=%d) for ring %d: %d\n", 
-				MTK_FE_IRQ_RX_RSS0 + i, rss_ring->irq, i, ret);
-			return ret;
+	if (soc->rx.desc_size == sizeof(struct mtk_rx_dma)) {
+		/* Set RSS rings to PSE modes */
+		for (i = 1; i <= MTK_HW_LRO_RING_NUM; i++) {
+			val = mtk_r32(eth, MTK_LRO_CTRL_DW2_CFG(i));
+			val |= MTK_RING_PSE_MODE;
+			mtk_w32(eth, val, MTK_LRO_CTRL_DW2_CFG(i));
 		}
-		dev_info(eth->dev, "mtk_rss_init: Successfully registered RSS IRQ %d for ring %d\n", 
-			 rss_ring->irq, i);
+
+		/* Enable non-lro multiple rx */
+		val = mtk_r32(eth, reg_map->pdma.lro_ctrl_dw0);
+		val |= MTK_NON_LRO_MULTI_EN;
+		mtk_w32(eth, val, reg_map->pdma.lro_ctrl_dw0);
+
+		/* Enable RSS dly int supoort */
+		val |= MTK_LRO_DLY_INT_EN;
+		mtk_w32(eth, val, reg_map->pdma.lro_ctrl_dw0);
 	}
 
-	dev_info(eth->dev, "RSS initialized with %d rings\n", eth->rss_ring_count);
+	/* Hash Type */
+	val = mtk_r32(eth, reg_map->pdma.rss_glo_cfg);
+	val |= MTK_RSS_IPV4_STATIC_HASH;
+	val |= MTK_RSS_IPV6_STATIC_HASH;
+	mtk_w32(eth, val, reg_map->pdma.rss_glo_cfg);
+
+	/* Hash Key */
+	for (i = 0; i < MTK_RSS_HASH_KEYSIZE / sizeof(u32); i++)
+		mtk_w32(eth, rss_params->hash_key[i], MTK_RSS_HASH_KEY_DW(i));
+
+	/* Select the size of indirection table */
+	for (i = 0; i < MTK_RSS_MAX_INDIRECTION_TABLE / 16; i++)
+		mtk_w32(eth, mtk_rss_indr_table(rss_params, i),
+			MTK_RSS_INDR_TABLE_DW(i));
+
+	/* Enable RSS */
+	val = mtk_r32(eth, reg_map->pdma.rss_glo_cfg);
+	val |= MTK_RSS_EN;
+	mtk_w32(eth, val, reg_map->pdma.rss_glo_cfg);
+
+	dev_info(eth->dev, "RSS initialized successfully with %d rings\n", soc->rss_num);
 	return 0;
 }
+
+/* Legacy RSS initialization - replaced by working version above */
 
 static int mtk_probe(struct platform_device *pdev)
 {
@@ -5681,6 +5607,7 @@ static int mtk_probe(struct platform_device *pdev)
 	struct device_node *mac_np, *mux_np;
 	struct mtk_eth *eth;
 	int err, i;
+	char *irqname;
 
 	dev_info(&pdev->dev, "mtk_probe: Starting ethernet driver initialization\n");
 
@@ -5814,9 +5741,15 @@ static int mtk_probe(struct platform_device *pdev)
 		}
 	}
 
-	err = mtk_get_irqs(pdev, eth);
+	err = mtk_get_irqs_fe(pdev, eth);
 	if (err)
 		goto err_wed_exit;
+
+	if (MTK_HAS_CAPS(eth->soc->caps, MTK_PDMA_INT)) {
+		err = mtk_get_irqs_pdma(pdev, eth);
+		if (err)
+			goto err_wed_exit;
+	}
 
 	for (i = 0; i < ARRAY_SIZE(eth->clks); i++) {
 		eth->clks[i] = devm_clk_get(eth->dev,
@@ -5845,6 +5778,10 @@ static int mtk_probe(struct platform_device *pdev)
 
 	eth->hwlro = MTK_HAS_CAPS(eth->soc->caps, MTK_HWLRO);
 
+	err = mtk_napi_init(eth);
+	if (err)
+		goto err_free_dev;
+
 	for_each_child_of_node(pdev->dev.of_node, mac_np) {
 		if (!of_device_is_compatible(mac_np,
 					     "mediatek,eth-mac"))
@@ -5861,19 +5798,65 @@ static int mtk_probe(struct platform_device *pdev)
 	}
 
 	if (MTK_HAS_CAPS(eth->soc->caps, MTK_SHARED_INT)) {
-		err = devm_request_irq(eth->dev, eth->irq[MTK_FE_IRQ_SHARED],
+		err = devm_request_irq(eth->dev, eth->irq_fe[MTK_FE_IRQ_SHARED],
 				       mtk_handle_irq, 0,
 				       dev_name(eth->dev), eth);
 	} else {
-		err = devm_request_irq(eth->dev, eth->irq[MTK_FE_IRQ_TX],
+		irqname = devm_kasprintf(eth->dev, GFP_KERNEL, "%s TX",
+					 dev_name(eth->dev));
+		err = devm_request_irq(eth->dev, eth->irq_fe[MTK_FE_IRQ_TX],
 				       mtk_handle_irq_tx, 0,
-				       dev_name(eth->dev), eth);
+				       irqname, eth);
 		if (err)
 			goto err_free_dev;
 
-		err = devm_request_irq(eth->dev, eth->irq[MTK_FE_IRQ_RX],
-				       mtk_handle_irq_rx, 0,
-				       dev_name(eth->dev), eth);
+		if (mtk_rss_available(eth)) {
+			irqname = devm_kasprintf(eth->dev, GFP_KERNEL, "%s PDMA RX %d",
+						 dev_name(eth->dev), 0);
+			err = devm_request_irq(eth->dev, eth->irq_pdma[0],
+					       mtk_handle_irq_rx, IRQF_SHARED,
+					       irqname, &eth->rx_napi[0]);
+			if (err)
+				goto err_free_dev;
+
+			if (MTK_HAS_CAPS(eth->soc->caps, MTK_RSS)) {
+				for (i = 1; i < MTK_RX_RSS_NUM; i++) {
+					irqname = devm_kasprintf(eth->dev, GFP_KERNEL,
+								 "%s RSS RX %d",
+								 dev_name(eth->dev), i);
+					err = devm_request_irq(eth->dev,
+							       eth->irq_pdma[MTK_RSS_RING(i)],
+							       mtk_handle_irq_rx, IRQF_SHARED,
+							       irqname,
+							       &eth->rx_napi[MTK_RSS_RING(i)]);
+					if (err)
+						goto err_free_dev;
+				}
+			}
+
+			if (eth->hwlro) {
+				for (i = 0; i < MTK_HW_LRO_RING_NUM; i++) {
+					irqname = devm_kasprintf(eth->dev, GFP_KERNEL,
+								 "%s LRO RX %d",
+								 dev_name(eth->dev), i);
+					err = devm_request_irq(eth->dev,
+							       eth->irq_pdma[MTK_HW_LRO_IRQ(i)],
+							       mtk_handle_irq_rx, IRQF_SHARED,
+							       irqname,
+							       &eth->rx_napi[MTK_HW_LRO_RING(i)]);
+					if (err)
+						goto err_free_dev;
+				}
+			}
+		} else {
+			irqname = devm_kasprintf(eth->dev, GFP_KERNEL, "%s RX",
+						 dev_name(eth->dev));
+			err = devm_request_irq(eth->dev, eth->irq_fe[MTK_FE_IRQ_RX],
+					       mtk_handle_irq_rx, 0,
+					       irqname, &eth->rx_napi[0]);
+			if (err)
+				goto err_free_dev;
+		}
 	}
 	if (err)
 		goto err_free_dev;
@@ -5937,7 +5920,7 @@ static int mtk_probe(struct platform_device *pdev)
 		} else
 			netif_info(eth, probe, eth->netdev[i],
 				   "mediatek frame engine at 0x%08lx, irq %d\n",
-				   eth->netdev[i]->base_addr, eth->irq[MTK_FE_IRQ_SHARED]);
+				   eth->netdev[i]->base_addr, eth->irq_fe[MTK_FE_IRQ_SHARED]);
 	}
 
 	/* we run 2 devices on the same DMA ring so we need a dummy device
@@ -5950,20 +5933,22 @@ static int mtk_probe(struct platform_device *pdev)
 		goto err_unreg_netdev;
 	}
 	netif_napi_add(eth->dummy_dev, &eth->tx_napi, mtk_napi_tx);
-	netif_napi_add(eth->dummy_dev, &eth->rx_napi, mtk_napi_rx);
+	netif_napi_add(eth->dummy_dev, &eth->rx_napi[0].napi, mtk_napi_rx);
 
 	dev_info(&pdev->dev, "mtk_probe: Setting platform driver data\n");
 	platform_set_drvdata(pdev, eth);
 	dev_info(&pdev->dev, "mtk_probe: Platform driver data set successfully\n");
 
 	/* Initialize RSS if supported - moved after platform_set_drvdata */
-	dev_info(&pdev->dev, "mtk_probe: Starting RSS initialization\n");
-	err = mtk_rss_init(eth);
-	if (err) {
-		dev_err(&pdev->dev, "mtk_probe: RSS initialization failed: %d\n", err);
-		goto err_unreg_netdev;
+	if (MTK_HAS_CAPS(eth->soc->caps, MTK_RSS)) {
+		dev_info(&pdev->dev, "mtk_probe: Starting RSS initialization\n");
+		err = mtk_rss_init(eth);
+		if (err) {
+			dev_err(&pdev->dev, "mtk_probe: RSS initialization failed: %d\n", err);
+			goto err_unreg_netdev;
+		}
+		dev_info(&pdev->dev, "mtk_probe: RSS initialization completed successfully\n");
 	}
-	dev_info(&pdev->dev, "mtk_probe: RSS initialization completed successfully\n");
 	schedule_delayed_work(&eth->reset.monitor_work,
 			      MTK_DMA_MONITOR_TIMEOUT);
 
@@ -6006,7 +5991,7 @@ static void mtk_remove(struct platform_device *pdev)
 	mtk_hw_deinit(eth);
 
 	netif_napi_del(&eth->tx_napi);
-	netif_napi_del(&eth->rx_napi);
+	netif_napi_del(&eth->rx_napi[0].napi);
 	mtk_cleanup(eth);
 	free_netdev(eth->dummy_dev);
 	mtk_mdio_cleanup(eth);
@@ -6029,7 +6014,7 @@ static const struct mtk_soc_data mt2701_data = {
 	},
 	.rx = {
 		.desc_size = sizeof(struct mtk_rx_dma),
-		.irq_done_mask = MTK_RX_DONE_INT,
+		.irq_done_mask = BIT(30),
 		.dma_l4_valid = RX_DMA_L4_VALID,
 		.dma_size = MTK_DMA_SIZE(2K),
 		.dma_max_len = MTK_TX_DMA_BUF_LEN,
@@ -6057,7 +6042,7 @@ static const struct mtk_soc_data mt7621_data = {
 	},
 	.rx = {
 		.desc_size = sizeof(struct mtk_rx_dma),
-		.irq_done_mask = MTK_RX_DONE_INT,
+		.irq_done_mask = BIT(30),
 		.dma_l4_valid = RX_DMA_L4_VALID,
 		.dma_size = MTK_DMA_SIZE(2K),
 		.dma_max_len = MTK_TX_DMA_BUF_LEN,
@@ -6087,7 +6072,7 @@ static const struct mtk_soc_data mt7622_data = {
 	},
 	.rx = {
 		.desc_size = sizeof(struct mtk_rx_dma),
-		.irq_done_mask = MTK_RX_DONE_INT,
+		.irq_done_mask = BIT(30),
 		.dma_l4_valid = RX_DMA_L4_VALID,
 		.dma_size = MTK_DMA_SIZE(2K),
 		.dma_max_len = MTK_TX_DMA_BUF_LEN,
@@ -6116,7 +6101,7 @@ static const struct mtk_soc_data mt7623_data = {
 	},
 	.rx = {
 		.desc_size = sizeof(struct mtk_rx_dma),
-		.irq_done_mask = MTK_RX_DONE_INT,
+		.irq_done_mask = BIT(30),
 		.dma_l4_valid = RX_DMA_L4_VALID,
 		.dma_size = MTK_DMA_SIZE(2K),
 		.dma_max_len = MTK_TX_DMA_BUF_LEN,
@@ -6142,7 +6127,7 @@ static const struct mtk_soc_data mt7629_data = {
 	},
 	.rx = {
 		.desc_size = sizeof(struct mtk_rx_dma),
-		.irq_done_mask = MTK_RX_DONE_INT,
+		.irq_done_mask = BIT(30),
 		.dma_l4_valid = RX_DMA_L4_VALID,
 		.dma_size = MTK_DMA_SIZE(2K),
 		.dma_max_len = MTK_TX_DMA_BUF_LEN,
@@ -6172,7 +6157,7 @@ static const struct mtk_soc_data mt7981_data = {
 	},
 	.rx = {
 		.desc_size = sizeof(struct mtk_rx_dma),
-		.irq_done_mask = MTK_RX_DONE_INT,
+		.irq_done_mask = BIT(30),
 		.dma_l4_valid = RX_DMA_L4_VALID_V2,
 		.dma_max_len = MTK_TX_DMA_BUF_LEN,
 		.dma_len_offset = 16,
@@ -6202,7 +6187,7 @@ static const struct mtk_soc_data mt7986_data = {
 	},
 	.rx = {
 		.desc_size = sizeof(struct mtk_rx_dma),
-		.irq_done_mask = MTK_RX_DONE_INT,
+		.irq_done_mask = BIT(30),
 		.dma_l4_valid = RX_DMA_L4_VALID_V2,
 		.dma_max_len = MTK_TX_DMA_BUF_LEN,
 		.dma_len_offset = 16,
@@ -6233,7 +6218,7 @@ static const struct mtk_soc_data mt7987_data = {
 	},
 	.rx = {
 		.desc_size = sizeof(struct mtk_rx_dma_v2),
-		.irq_done_mask = MTK_RX_DONE_INT_V2,
+		.irq_done_mask = BIT(30),
 		.dma_l4_valid = RX_DMA_L4_VALID_V2,
 		.dma_max_len = MTK_TX_DMA_BUF_LEN_V2,
 		.dma_len_offset = 8,
@@ -6244,6 +6229,7 @@ static const struct mtk_soc_data mt7987_data = {
 static const struct mtk_soc_data mt7988_data = {
 	.reg_map = &mt7988_reg_map,
 	.ana_rgc3 = 0x128,
+	.rss_num = 4,
 	.caps = MT7988_CAPS,
 	.hw_features = MTK_HW_FEATURES,
 	.required_clks = MT7988_CLKS_BITMAP,
@@ -6263,7 +6249,7 @@ static const struct mtk_soc_data mt7988_data = {
 	},
 	.rx = {
 		.desc_size = sizeof(struct mtk_rx_dma_v2),
-		.irq_done_mask = MTK_RX_DONE_INT_V2,
+		.irq_done_mask = BIT(30),
 		.dma_l4_valid = RX_DMA_L4_VALID_V2,
 		.dma_max_len = MTK_TX_DMA_BUF_LEN_V2,
 		.dma_len_offset = 8,
@@ -6286,7 +6272,7 @@ static const struct mtk_soc_data rt5350_data = {
 	},
 	.rx = {
 		.desc_size = sizeof(struct mtk_rx_dma),
-		.irq_done_mask = MTK_RX_DONE_INT,
+		.irq_done_mask = BIT(30),
 		.dma_l4_valid = RX_DMA_L4_VALID_PDMA,
 		.dma_max_len = MTK_TX_DMA_BUF_LEN,
 		.dma_len_offset = 16,
