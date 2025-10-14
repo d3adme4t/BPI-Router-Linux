@@ -27,6 +27,7 @@
 #include <linux/gpio/consumer.h>
 #include <linux/jhash.h>
 #include <linux/bitfield.h>
+#include <linux/iopoll.h>
 #include <net/dsa.h>
 #include <net/dst_metadata.h>
 #include <net/page_pool/helpers.h>
@@ -3494,12 +3495,13 @@ static int mtk_get_irqs(struct platform_device *pdev, struct mtk_eth *eth)
 	/* Get RSS interrupts if RSS is supported */
 	if (MTK_HAS_CAPS(eth->soc->caps, MTK_RSS)) {
 		dev_info(&pdev->dev, "mtk_get_irqs: RSS supported, getting RSS interrupts\n");
-		eth->irq[MTK_FE_IRQ_RX_RSS0] = platform_get_irq_byname_optional(pdev, "fe3");
-		eth->irq[MTK_FE_IRQ_RX_RSS1] = platform_get_irq_byname_optional(pdev, "pdma0");
-		eth->irq[MTK_FE_IRQ_RX_RSS2] = platform_get_irq_byname_optional(pdev, "pdma1");
-		eth->irq[MTK_FE_IRQ_RX_RSS3] = platform_get_irq_byname_optional(pdev, "pdma2");
+		/* Use all 4 PDMA interrupts for RSS rings - better performance and hardware utilization */
+		eth->irq[MTK_FE_IRQ_RX_RSS0] = platform_get_irq_byname_optional(pdev, "pdma0");
+		eth->irq[MTK_FE_IRQ_RX_RSS1] = platform_get_irq_byname_optional(pdev, "pdma1");
+		eth->irq[MTK_FE_IRQ_RX_RSS2] = platform_get_irq_byname_optional(pdev, "pdma2");
+		eth->irq[MTK_FE_IRQ_RX_RSS3] = platform_get_irq_byname_optional(pdev, "pdma3");
 		
-		dev_info(&pdev->dev, "mtk_get_irqs: RSS interrupts - fe3=%d, pdma0=%d, pdma1=%d, pdma2=%d\n",
+		dev_info(&pdev->dev, "mtk_get_irqs: RSS interrupts - pdma0=%d, pdma1=%d, pdma2=%d, pdma3=%d\n",
 			 eth->irq[MTK_FE_IRQ_RX_RSS0], eth->irq[MTK_FE_IRQ_RX_RSS1],
 			 eth->irq[MTK_FE_IRQ_RX_RSS2], eth->irq[MTK_FE_IRQ_RX_RSS3]);
 	} else {
@@ -5522,6 +5524,103 @@ static int mtk_setup_legacy_sram(struct mtk_eth *eth, struct resource *res)
 				 MTK_ETH_NETSYS_V2_SRAM_SIZE, NUMA_NO_NODE);
 }
 
+/* Configure RSS hardware registers using safe handshake protocol */
+static int mtk_rss_hw_config(struct mtk_eth *eth)
+{
+	/* Standard Toeplitz key from Microsoft RSS specification */
+	static const u32 rss_hash_key[MTK_RSS_HASH_KEY_DW_COUNT] = {
+		0x6d5a56da, 0x255b0ec2, 0x41670961, 0x1e5c2bc4, 0x5229b5a9,
+		0x2d0a9f4b, 0x5f0e3b17, 0x3b2e1b8c, 0x4a3e5729, 0x0d9f1a2c
+	};
+	void __iomem *rss_base;
+	u32 val, i;
+	int ret;
+
+	dev_info(eth->dev, "Configuring RSS hardware engine at 0x%x\n", MTK_RSS_BASE);
+
+	/* Map RSS register space directly */
+	rss_base = ioremap(MTK_RSS_BASE, 0x1000);
+	if (!rss_base) {
+		dev_err(eth->dev, "Failed to map RSS register space at 0x%x\n", MTK_RSS_BASE);
+		return -ENOMEM;
+	}
+
+	/* Step 1: Wait for hardware to be ready using robust polling */
+	ret = readl_poll_timeout(rss_base, val, (val & MTK_RSS_CFG_RDY), 0, 1000);
+	if (ret) {
+		dev_err(eth->dev, "RSS hardware not ready (CFG_RDY timeout, val=0x%x)\n", val);
+		iounmap(rss_base);
+		return -ETIMEDOUT;
+	}
+
+	dev_info(eth->dev, "RSS hardware ready for configuration (GLO_CFG=0x%x)\n", val);
+
+	/* Step 2: Program 40-byte Toeplitz hash key */
+	for (i = 0; i < MTK_RSS_HASH_KEY_DW_COUNT; i++) {
+		writel(rss_hash_key[i], rss_base + (MTK_RSS_HASH_KEY_DW0 - MTK_RSS_BASE) + (i * 4));
+	}
+	dev_info(eth->dev, "RSS hash key programmed (Toeplitz)\n");
+
+	/* Step 3: Configure indirection table for round-robin distribution */
+	for (i = 0; i < MTK_RSS_INDIR_SIZE / 16; i++) {
+		/* Each DW holds 16 x 2-bit queue indices */
+		u32 table_val = 0;
+		int j;
+		
+		for (j = 0; j < 16; j++) {
+			u32 queue = (i * 16 + j) % MTK_MAX_RX_RING_NUM;
+			table_val |= (queue << (j * 2));
+		}
+		
+		writel(table_val, rss_base + (MTK_RSS_INDR_TABLE_DW0 - MTK_RSS_BASE) + (i * 4));
+	}
+	dev_info(eth->dev, "RSS indirection table configured (%d entries -> %d queues)\n",
+		 MTK_RSS_INDIR_SIZE, MTK_MAX_RX_RING_NUM);
+
+	/* Step 4: Configure global settings */
+	val = readl(rss_base);
+	
+	/* Set indirection table size: 128 entries = log2(128) - 1 = 6 */
+	val &= ~MTK_RSS_INDR_TBL_SIZE_MASK;
+	val |= (6 << MTK_RSS_INDR_TBL_SIZE_SHIFT);
+	
+	/* Enable 4-tuple hashing for IPv4 and IPv6 */
+	val |= MTK_RSS_IPV4_4T_HASH_EN | MTK_RSS_IPV6_4T_HASH_EN;
+	
+	/* Enable RSS */
+	val |= MTK_RSS_ENABLE;
+	
+	/* Write configuration */
+	writel(val, rss_base);
+
+	/* Step 5: Initiate configuration change */
+	val = readl(rss_base);
+	val |= MTK_RSS_CFG_REQ;
+	writel(val, rss_base);
+
+	/* Step 6: Wait for configuration to complete using robust polling */
+	ret = readl_poll_timeout(rss_base, val, !(val & MTK_RSS_CFG_REQ), 0, 1000);
+	if (ret) {
+		dev_err(eth->dev, "RSS configuration change timeout (GLO_CFG=0x%x)\n", val);
+		iounmap(rss_base);
+		return -ETIMEDOUT;
+	}
+
+	/* Step 7: Verify RSS is enabled */
+	val = readl(rss_base);
+	if (!(val & MTK_RSS_ENABLE)) {
+		dev_err(eth->dev, "Failed to enable RSS engine (GLO_CFG=0x%x)\n", val);
+		iounmap(rss_base);
+		return -EIO;
+	}
+
+	dev_info(eth->dev, "RSS hardware enabled successfully (GLO_CFG=0x%x)\n", val);
+	
+	/* Clean up mapping */
+	iounmap(rss_base);
+	return 0;
+}
+
 /* Initialize RSS functionality */
 static int mtk_rss_init(struct mtk_eth *eth)
 {
@@ -5536,6 +5635,13 @@ static int mtk_rss_init(struct mtk_eth *eth)
 	}
 
 	dev_info(eth->dev, "mtk_rss_init: RSS is supported, initializing %d rings\n", MTK_MAX_RX_RING_NUM);
+
+	/* CRITICAL: Configure hardware BEFORE interrupt registration */
+	ret = mtk_rss_hw_config(eth);
+	if (ret) {
+		dev_err(eth->dev, "RSS hardware configuration failed: %d\n", ret);
+		return ret;
+	}
 
 	eth->rss_enabled = true;
 	eth->rss_ring_count = MTK_MAX_RX_RING_NUM;

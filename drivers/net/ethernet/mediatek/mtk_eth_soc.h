@@ -297,6 +297,43 @@
 #define FC_THRES_DROP_EN	(7 << 16)
 #define FC_THRES_MIN		0x4444
 
+/* RSS Engine Registers - MT7988A absolute addresses */
+#define MTK_RSS_BASE                    0x15102800
+#define MTK_RSS_GLO_CFG                 0x15102800
+#define MTK_RSS_HASH_KEY_DW0            0x15102820
+#define MTK_RSS_HASH_KEY_DW1            0x15102824
+#define MTK_RSS_HASH_KEY_DW2            0x15102828
+#define MTK_RSS_HASH_KEY_DW3            0x1510282c
+#define MTK_RSS_HASH_KEY_DW4            0x15102830
+#define MTK_RSS_HASH_KEY_DW5            0x15102834
+#define MTK_RSS_HASH_KEY_DW6            0x15102838
+#define MTK_RSS_HASH_KEY_DW7            0x1510283c
+#define MTK_RSS_HASH_KEY_DW8            0x15102840
+#define MTK_RSS_HASH_KEY_DW9            0x15102844
+#define MTK_RSS_INDR_TABLE_DW0          0x15102850
+#define MTK_RSS_INDR_TABLE_DW1          0x15102854
+#define MTK_RSS_INDR_TABLE_DW2          0x15102858
+#define MTK_RSS_INDR_TABLE_DW3          0x1510285c
+#define MTK_RSS_INDR_TABLE_DW4          0x15102860
+#define MTK_RSS_INDR_TABLE_DW5          0x15102864
+#define MTK_RSS_INDR_TABLE_DW6          0x15102868
+#define MTK_RSS_INDR_TABLE_DW7          0x1510286c
+
+/* RSS_GLO_CFG bitfields - MT7988A correct values */
+#define MTK_RSS_ENABLE                  BIT(31)  /* RSS_EN */
+#define MTK_RSS_CFG_REQ                 BIT(1)   /* CFG_REQ */
+#define MTK_RSS_CFG_RDY                 BIT(0)   /* CFG_RDY (read-only) */
+#define MTK_RSS_INDR_TBL_SIZE_SHIFT     8
+#define MTK_RSS_INDR_TBL_SIZE_MASK      (0xf << MTK_RSS_INDR_TBL_SIZE_SHIFT)
+#define MTK_RSS_IPV4_2T_HASH_EN         BIT(24)  /* IPv4 2-tuple hashing */
+#define MTK_RSS_IPV4_4T_HASH_EN         BIT(25)  /* IPv4 4-tuple hashing */
+#define MTK_RSS_IPV6_2T_HASH_EN         BIT(26)  /* IPv6 2-tuple hashing */
+#define MTK_RSS_IPV6_4T_HASH_EN         BIT(27)  /* IPv6 4-tuple hashing */
+
+/* RSS Configuration Constants */
+#define MTK_RSS_HASH_KEY_DW_COUNT       10
+#define MTK_RSS_INDIR_SIZE              128
+
 /* QDMA Interrupt Status Register */
 #define MTK_RX_DONE_DLY		BIT(30)
 #define MTK_TX_DONE_DLY		BIT(28)
