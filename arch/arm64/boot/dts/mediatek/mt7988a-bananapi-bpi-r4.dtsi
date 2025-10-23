@@ -169,7 +169,6 @@
 };
 
 &gmac2 {
-	managed = "in-band-status";
 	phy-mode = "usxgmii";
 	sfp = <&sfp1>;
 	status = "okay";

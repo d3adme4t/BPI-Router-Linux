@@ -5691,29 +5691,41 @@ static int mtk_add_mac(struct mtk_eth *eth, struct device_node *np)
 				mac->phylink_config.pcs_interfaces);
 
 			err = fwnode_phylink_pcs_parse(of_fwnode_handle(np), NULL, &count);
-			if (err == -ENODEV) {
+			/* Treat any error as "no PCS" - this is OK for SFP interfaces */
+			if (err) {
 				err = 0;
 				goto no_pcs;
 			}
 
-			if (count > 2)
-				err = -ENOMEM;
-
-			if (err)
-				goto free_netdev;
+			if (count > 2) {
+				/* Too many PCS - fall back to legacy method */
+				goto no_pcs;
+			}
 
 			err = fwnode_phylink_pcs_parse(of_fwnode_handle(np), mac->available_pcs, &count);
-			if (err)
-				goto free_netdev;
+			if (err) {
+				/* PCS parse failed - fall back to legacy method */
+				err = 0;
+				goto no_pcs;
+			}
 
 			mac->phylink_config.available_pcs = mac->available_pcs;
 			mac->phylink_config.num_available_pcs = count;
 		} else {
-			sid = (MTK_HAS_CAPS(eth->soc->caps, MTK_SHARED_SGMII)) ?
-			       0 : id;
-
-			mac->phylink_config.available_pcs = &eth->sgmii_pcs[sid];
-			mac->phylink_config.num_available_pcs = 1;
+			/* For SFP interfaces, don't provide PCS - use out-of-band management */
+			if (phy_mode == PHY_INTERFACE_MODE_USXGMII ||
+			    phy_mode == PHY_INTERFACE_MODE_10GBASER ||
+			    phy_mode == PHY_INTERFACE_MODE_5GBASER) {
+				/* SFP interfaces use out-of-band management, no PCS needed */
+				mac->phylink_config.available_pcs = NULL;
+				mac->phylink_config.num_available_pcs = 0;
+			} else {
+				/* Legacy SGMII interfaces still need PCS */
+				sid = (MTK_HAS_CAPS(eth->soc->caps, MTK_SHARED_SGMII)) ?
+				       0 : id;
+				mac->phylink_config.available_pcs = &eth->sgmii_pcs[sid];
+				mac->phylink_config.num_available_pcs = 1;
+			}
 		}
 
 		phy_interface_or(mac->phylink_config.supported_interfaces,
