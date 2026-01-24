@@ -4870,6 +4870,11 @@ static int mtk_change_mtu(struct net_device *dev, int new_mtu)
 		return -EINVAL;
 	}
 
+	if (test_bit(MTK_RESETTING, &eth->state)) {
+		netdev_warn(dev, "MTU change rejected: device is resetting\n");
+		return -EBUSY;
+	}
+
 	/* Calculate what the new Request Max MTU would be if we applied this change */
 	for (i = 0; i < MTK_MAX_DEVS; i++) {
 		if (!eth->netdev[i])
@@ -4908,6 +4913,10 @@ static int mtk_change_mtu(struct net_device *dev, int new_mtu)
 				set_bit(i, &restart);
 			}
 		}
+
+		if (restart)
+			netdev_info(dev,
+				    "Coordinated restart to apply MTU/Buffer change\n");
 
 		for (i = 0; i < MTK_MAX_DEVS; i++) {
 			if (!eth->netdev[i] || !test_bit(i, &restart))
