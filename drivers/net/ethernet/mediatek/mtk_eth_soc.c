@@ -4859,7 +4859,9 @@ static int mtk_change_mtu(struct net_device *dev, int new_mtu)
 {
 	struct mtk_mac *mac = netdev_priv(dev);
 	struct mtk_eth *eth = mac->hw;
+	unsigned long restart = 0;
 	int i, length, max_mtu = 0;
+	int err = 0;
 	u32 new_rx_buf_len;
 
 	if (rcu_access_pointer(eth->prog) &&
@@ -4895,38 +4897,44 @@ static int mtk_change_mtu(struct net_device *dev, int new_mtu)
 
 	/* If the new buffer length differs from the current global setting */
 	if (new_rx_buf_len != eth->rx_buf_len) {
-		/* We cannot change buffer size if ANY other port is running,
-		 * because they share the global DMA engine which must be reset.
+		/* We must reset the shared DMA engine, so coordinate a restart
+		 * across all running MAC netdevs to preserve their state.
 		 */
 		for (i = 0; i < MTK_MAX_DEVS; i++) {
-			if (!eth->netdev[i] || eth->netdev[i] == dev)
+			if (!eth->netdev[i])
 				continue;
 
 			if (netif_running(eth->netdev[i])) {
-				netdev_err(
-					dev,
-					"Cannot change MTU/Jumbo state while other ports are active. Please bring down %s first.\n",
-					eth->netdev[i]->name);
-				return -EBUSY;
+				set_bit(i, &restart);
 			}
 		}
 
-		/* If we are here, it is safe to reset because no other ports are up.
-		 * If this interface is running, we must reset it to apply the new buffer size.
-		 */
-		if (netif_running(dev)) {
-			netdev_info(
-				dev,
-				"Resetting interface to apply new MTU/Buffer size...\n");
-			mtk_stop(dev);
-			WRITE_ONCE(dev->mtu, new_mtu);
-			eth->rx_buf_len = new_rx_buf_len;
-			mtk_open(dev);
-			return 0;
+		for (i = 0; i < MTK_MAX_DEVS; i++) {
+			if (!eth->netdev[i] || !test_bit(i, &restart))
+				continue;
+			mtk_stop(eth->netdev[i]);
 		}
 
-		/* Interface is down, just update state */
+		WRITE_ONCE(dev->mtu, new_mtu);
 		eth->rx_buf_len = new_rx_buf_len;
+
+		for (i = 0; i < MTK_MAX_DEVS; i++) {
+			int ret;
+
+			if (!eth->netdev[i] || !test_bit(i, &restart))
+				continue;
+
+			ret = mtk_open(eth->netdev[i]);
+			if (ret && !err)
+				err = ret;
+		}
+
+		if (err)
+			netdev_err(dev,
+				   "Failed to restart one or more ports after MTU change: %d\n",
+				   err);
+
+		return err;
 	}
 
 	WRITE_ONCE(dev->mtu, new_mtu);
