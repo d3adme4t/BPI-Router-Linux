@@ -2428,9 +2428,17 @@ static int mtk_poll_rx(struct napi_struct *napi, int budget,
 			if (MTK_HAS_CAPS(eth->soc->caps, MTK_36BIT_DMA))
 				addr64 = RX_DMA_GET_ADDR64(trxd.rxd2);
 
-			dma_unmap_single(eth->dma_dev,
-					 ((u64)trxd.rxd1 | addr64),
-					 ring->buf_size, DMA_FROM_DEVICE);
+			/* Sync only the received payload to reduce cache
+			 * maintenance cost; skip the full-buffer sync on unmap.
+			 */
+			dma_sync_single_for_cpu(eth->dma_dev,
+						((u64)trxd.rxd1 | addr64),
+						pktlen, DMA_FROM_DEVICE);
+
+			dma_unmap_single_attrs(eth->dma_dev,
+					       ((u64)trxd.rxd1 | addr64),
+					       ring->buf_size, DMA_FROM_DEVICE,
+					       DMA_ATTR_SKIP_CPU_SYNC);
 
 			skb = build_skb(data, ring->frag_size);
 			if (unlikely(!skb)) {
