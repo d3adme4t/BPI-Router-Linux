@@ -1992,13 +1992,14 @@ static struct page_pool *mtk_create_page_pool(struct mtk_eth *eth,
 					      int id, int size)
 {
 	struct page_pool_params pp_params = {
-		.order = 0,
+		.order = get_order(eth->rx_buf_len + MTK_PP_HEADROOM),
 		.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV,
 		.pool_size = size,
 		.nid = NUMA_NO_NODE,
 		.dev = eth->dma_dev,
 		.offset = MTK_PP_HEADROOM,
-		.max_len = MTK_PP_MAX_BUF_SIZE,
+		.max_len = PAGE_SIZE
+			   << get_order(eth->rx_buf_len + MTK_PP_HEADROOM),
 	};
 	struct page_pool *pp;
 	int err;
@@ -2934,7 +2935,7 @@ static int mtk_rx_alloc(struct mtk_eth *eth, int ring_no, int rx_flag)
 	if (!ring->data)
 		return -ENOMEM;
 
-	if (mtk_page_pool_enabled(eth) && rcu_access_pointer(eth->prog)) {
+	if (mtk_page_pool_enabled(eth)) {
 		struct page_pool *pp;
 
 		pp = mtk_create_page_pool(eth, &ring->xdp_q, ring_no,
