@@ -3992,10 +3992,7 @@ static int mtk_open(struct net_device *dev)
 {
 	struct mtk_mac *mac = netdev_priv(dev);
 	struct mtk_eth *eth = mac->hw;
-	struct mtk_mac *target_mac;
-	int i, err, ppe_num;
-
-	ppe_num = eth->soc->ppe_num;
+	int i, err;
 
 	err = phylink_of_phy_connect(mac->phylink, mac->of_node, 0);
 	if (err) {
@@ -4018,27 +4015,6 @@ static int mtk_open(struct net_device *dev)
 
 		for (i = 0; i < ARRAY_SIZE(eth->ppe); i++)
 			mtk_ppe_start(eth->ppe[i]);
-
-		for (i = 0; i < MTK_MAX_DEVS; i++) {
-			if (!eth->netdev[i])
-				continue;
-
-			target_mac = netdev_priv(eth->netdev[i]);
-			if (!soc->offload_version) {
-				target_mac->ppe_idx = 0;
-				gdm_config = MTK_GDMA_TO_PDMA;
-			} else if (ppe_num >= 3 && target_mac->id == 2) {
-				target_mac->ppe_idx = 2;
-				gdm_config = soc->reg_map->gdma_to_ppe[2];
-			} else if (ppe_num >= 2 && target_mac->id == 1) {
-				target_mac->ppe_idx = 1;
-				gdm_config = soc->reg_map->gdma_to_ppe[1];
-			} else {
-				target_mac->ppe_idx = 0;
-				gdm_config = soc->reg_map->gdma_to_ppe[0];
-			}
-			mtk_gdm_config(eth, target_mac->id, gdm_config);
-		}
 
 		napi_enable(&eth->tx_napi);
 		napi_enable(&eth->rx_napi[0].napi);
@@ -4063,10 +4039,34 @@ static int mtk_open(struct net_device *dev)
 					MTK_RX_DONE_INT(MTK_HW_LRO_RING(i)));
 			}
 		}
-
 		refcount_set(&eth->dma_refcnt, 1);
 	} else {
 		refcount_inc(&eth->dma_refcnt);
+		/* dma_refcnt > 0 means other ports are active.
+		 * We must ensure this specific port's traffic is enabled,
+		 * because mtk_stop() now disables it explicitly.
+		 */
+	}
+
+	/* Always configure GDMA for this specific mac to ensure traffic flows */
+	{
+		const struct mtk_soc_data *soc = eth->soc;
+		u32 gdm_config;
+
+		if (!soc->offload_version) {
+			mac->ppe_idx = 0;
+			gdm_config = MTK_GDMA_TO_PDMA;
+		} else if (soc->ppe_num >= 3 && mac->id == 2) {
+			mac->ppe_idx = 2;
+			gdm_config = soc->reg_map->gdma_to_ppe[2];
+		} else if (soc->ppe_num >= 2 && mac->id == 1) {
+			mac->ppe_idx = 1;
+			gdm_config = soc->reg_map->gdma_to_ppe[1];
+		} else {
+			mac->ppe_idx = 0;
+			gdm_config = soc->reg_map->gdma_to_ppe[0];
+		}
+		mtk_gdm_config(eth, mac->id, gdm_config);
 	}
 
 	phylink_start(mac->phylink);
@@ -4081,8 +4081,8 @@ static int mtk_open(struct net_device *dev)
 	} else {
 		eth->netdev[mac->id]->max_mtu =
 			MTK_MAX_RX_LENGTH_2K - MTK_RX_ETH_HLEN;
-		netdev_err(dev, "%s: set max-mtu of mac #%d to %d\n", __func__,
-			   mac->id, eth->netdev[mac->id]->max_mtu);
+		netdev_err(dev, "%s: set max-mtu of mac #%d to %d\n",
+			   __func__, mac->id, eth->netdev[mac->id]->max_mtu);
 	}
 	if (mtk_is_netsys_v2_or_greater(eth))
 		return 0;
@@ -4091,30 +4091,30 @@ static int mtk_open(struct net_device *dev)
 		for (i = 0; i < ARRAY_SIZE(eth->dsa_meta); i++) {
 			struct metadata_dst *md_dst = eth->dsa_meta[i];
 
-			if (md_dst)
-				continue;
+		if (md_dst)
+			continue;
 
-			md_dst = metadata_dst_alloc(0, METADATA_HW_PORT_MUX,
-						    GFP_KERNEL);
-			if (!md_dst)
-				return -ENOMEM;
+		md_dst =
+			metadata_dst_alloc(0, METADATA_HW_PORT_MUX, GFP_KERNEL);
+		if (!md_dst)
+			return -ENOMEM;
 
-			md_dst->u.port_info.port_id = i;
-			eth->dsa_meta[i] = md_dst;
-		}
-	} else {
-		/* Hardware DSA untagging and VLAN RX offloading need to be
+		md_dst->u.port_info.port_id = i;
+		eth->dsa_meta[i] = md_dst;
+	}
+} else {
+	/* Hardware DSA untagging and VLAN RX offloading need to be
 		 * disabled if at least one MAC does not use DSA.
 		 */
-		u32 val = mtk_r32(eth, MTK_CDMP_IG_CTRL);
+	u32 val = mtk_r32(eth, MTK_CDMP_IG_CTRL);
 
-		val &= ~MTK_CDMP_STAG_EN;
-		mtk_w32(eth, val, MTK_CDMP_IG_CTRL);
+	val &= ~MTK_CDMP_STAG_EN;
+	mtk_w32(eth, val, MTK_CDMP_IG_CTRL);
 
-		mtk_w32(eth, 0, MTK_CDMP_EG_CTRL);
-	}
+	mtk_w32(eth, 0, MTK_CDMP_EG_CTRL);
+}
 
-	return 0;
+return 0;
 }
 
 static void mtk_stop_dma(struct mtk_eth *eth, u32 glo_cfg)
@@ -4151,6 +4151,9 @@ static int mtk_stop(struct net_device *dev)
 	netif_tx_disable(dev);
 
 	phylink_disconnect_phy(mac->phylink);
+
+	/* stop the specific mac directly to drain traffic */
+	mtk_gdm_config(eth, mac->id, MTK_GDMA_DROP_ALL);
 
 	/* only shutdown DMA if this is the last user */
 	if (!refcount_dec_and_test(&eth->dma_refcnt))
