@@ -2369,7 +2369,10 @@ static int mtk_poll_rx(struct napi_struct *napi, int budget,
 				ring->page_pool, &dma_addr, GFP_ATOMIC);
 			if (unlikely(!new_data)) {
 				netdev->stats.rx_dropped++;
-				goto release_desc;
+				new_data = data;
+				dma_addr = page_pool_get_dma_addr(page) +
+					   MTK_PP_HEADROOM;
+				goto skip_rx;
 			}
 
 			dma_sync_single_for_cpu(
