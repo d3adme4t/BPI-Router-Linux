@@ -1064,6 +1064,7 @@ struct mtk_rx_ring {
 	u32 ring_no;
 	/* page_pool */
 	struct page_pool *page_pool;
+	u32 page_pool_size;
 	struct xdp_rxq_info xdp_q;
 };
 

@@ -2380,7 +2380,7 @@ static int mtk_poll_rx(struct napi_struct *napi, int budget,
 				page_pool_get_dma_addr(page) + MTK_PP_HEADROOM,
 				pktlen, page_pool_get_dma_dir(ring->page_pool));
 
-			xdp_init_buff(&xdp, ring->frag_size, &ring->xdp_q);
+			xdp_init_buff(&xdp, ring->page_pool_size, &ring->xdp_q);
 			xdp_prepare_buff(&xdp, data, MTK_PP_HEADROOM, pktlen,
 					 true);
 			xdp_buff_clear_frags_flag(&xdp);
@@ -2392,7 +2392,7 @@ static int mtk_poll_rx(struct napi_struct *napi, int budget,
 			if (ret != XDP_PASS)
 				goto skip_rx;
 
-			skb = build_skb(data, ring->frag_size);
+			skb = build_skb(data, ring->page_pool_size);
 			if (unlikely(!skb)) {
 				page_pool_put_full_page(ring->page_pool, page,
 							true);
@@ -2946,6 +2946,8 @@ static int mtk_rx_alloc(struct mtk_eth *eth, int ring_no, int rx_flag)
 			return PTR_ERR(pp);
 
 		ring->page_pool = pp;
+		ring->page_pool_size =
+			PAGE_SIZE << get_order(ring->buf_size + MTK_PP_HEADROOM);
 	}
 
 	ring->dma =
