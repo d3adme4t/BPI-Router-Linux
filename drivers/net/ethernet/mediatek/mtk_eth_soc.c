@@ -1978,16 +1978,16 @@ static bool mtk_page_pool_enabled(struct mtk_eth *eth)
 
 static struct page_pool *mtk_create_page_pool(struct mtk_eth *eth,
 					      struct xdp_rxq_info *xdp_q,
-					      int id, int size)
+					      int id, int size, int buf_size)
 {
 	struct page_pool_params pp_params = {
-		.order = 0,
+		.order = get_order(buf_size + MTK_PP_HEADROOM),
 		.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV,
 		.pool_size = size,
 		.nid = NUMA_NO_NODE,
 		.dev = eth->dma_dev,
 		.offset = MTK_PP_HEADROOM,
-		.max_len = MTK_PP_MAX_BUF_SIZE,
+		.max_len = buf_size,
 	};
 	struct page_pool *pp;
 	int err;
@@ -2366,7 +2366,7 @@ static int mtk_poll_rx(struct napi_struct *napi, int budget,
 				page_pool_get_dma_addr(page) + MTK_PP_HEADROOM,
 				pktlen, page_pool_get_dma_dir(ring->page_pool));
 
-			xdp_init_buff(&xdp, PAGE_SIZE, &ring->xdp_q);
+			xdp_init_buff(&xdp, ring->page_pool_size, &ring->xdp_q);
 			xdp_prepare_buff(&xdp, data, MTK_PP_HEADROOM, pktlen,
 					 true);
 			xdp_buff_clear_frags_flag(&xdp);
@@ -2378,7 +2378,7 @@ static int mtk_poll_rx(struct napi_struct *napi, int budget,
 			if (ret != XDP_PASS)
 				goto skip_rx;
 
-			skb = build_skb(data, PAGE_SIZE);
+			skb = build_skb(data, ring->page_pool_size);
 			if (unlikely(!skb)) {
 				page_pool_put_full_page(ring->page_pool,
 							page, true);
@@ -2914,15 +2914,16 @@ static int mtk_rx_alloc(struct mtk_eth *eth, int ring_no, int rx_flag)
 	if (!ring->data)
 		return -ENOMEM;
 
-	if (mtk_page_pool_enabled(eth) && rcu_access_pointer(eth->prog))  {
+	if (mtk_page_pool_enabled(eth)) {
 		struct page_pool *pp;
 
 		pp = mtk_create_page_pool(eth, &ring->xdp_q, ring_no,
-					  rx_dma_size);
+					  rx_dma_size, ring->buf_size);
 		if (IS_ERR(pp))
 			return PTR_ERR(pp);
 
 		ring->page_pool = pp;
+		ring->page_pool_size = PAGE_SIZE << get_order(ring->buf_size + MTK_PP_HEADROOM);
 	}
 
 	ring->dma = mtk_dma_ring_alloc(eth,
