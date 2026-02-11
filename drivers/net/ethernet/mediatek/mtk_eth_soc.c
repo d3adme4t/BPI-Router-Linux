@@ -2393,9 +2393,8 @@ static int mtk_poll_rx(struct napi_struct *napi, int budget,
 				skb_metadata_set(skb, metasize);
 			skb_mark_for_recycle(skb);
 		} else {
-			if (ring->frag_size <= PAGE_SIZE)
-				new_data = napi_alloc_frag(ring->frag_size);
-			else
+			new_data = napi_alloc_frag(ring->frag_size);
+			if (!new_data)
 				new_data = mtk_max_buf_alloc(ring->frag_size, GFP_ATOMIC);
 
 			if (unlikely(!new_data)) {
@@ -2945,9 +2944,8 @@ static int mtk_rx_alloc(struct mtk_eth *eth, int ring_no, int rx_flag)
 			if (!data)
 				return -ENOMEM;
 		} else {
-			if (ring->frag_size <= PAGE_SIZE)
-				data = netdev_alloc_frag(ring->frag_size);
-			else
+			data = netdev_alloc_frag(ring->frag_size);
+			if (!data)
 				data = mtk_max_buf_alloc(ring->frag_size, GFP_KERNEL);
 
 			if (!data)
