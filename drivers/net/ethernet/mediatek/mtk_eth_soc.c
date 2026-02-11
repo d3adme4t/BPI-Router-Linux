@@ -2359,7 +2359,9 @@ static int mtk_poll_rx(struct napi_struct *napi, int budget,
 							  GFP_ATOMIC);
 			if (unlikely(!new_data)) {
 				netdev->stats.rx_dropped++;
-				goto release_desc;
+				new_data = data;
+				dma_addr = page_pool_get_dma_addr(page) + MTK_PP_HEADROOM;
+				goto skip_rx;
 			}
 
 			dma_sync_single_for_cpu(eth->dma_dev,
@@ -3963,10 +3965,7 @@ static int mtk_open(struct net_device *dev)
 {
 	struct mtk_mac *mac = netdev_priv(dev);
 	struct mtk_eth *eth = mac->hw;
-	struct mtk_mac *target_mac;
-	int i, err, ppe_num;
-
-	ppe_num = eth->soc->ppe_num;
+	int i, err;
 
 	err = phylink_of_phy_connect(mac->phylink, mac->of_node, 0);
 	if (err) {
@@ -3977,8 +3976,6 @@ static int mtk_open(struct net_device *dev)
 
 	/* we run 2 netdevs on the same dma ring so we only bring it up once */
 	if (!refcount_read(&eth->dma_refcnt)) {
-		const struct mtk_soc_data *soc = eth->soc;
-		u32 gdm_config;
 		int i;
 
 		err = mtk_start_dma(eth);
@@ -3989,27 +3986,6 @@ static int mtk_open(struct net_device *dev)
 
 		for (i = 0; i < ARRAY_SIZE(eth->ppe); i++)
 			mtk_ppe_start(eth->ppe[i]);
-
-		for (i = 0; i < MTK_MAX_DEVS; i++) {
-			if (!eth->netdev[i])
-				continue;
-
-			target_mac = netdev_priv(eth->netdev[i]);
-			if (!soc->offload_version) {
-				target_mac->ppe_idx = 0;
-				gdm_config = MTK_GDMA_TO_PDMA;
-			} else if (ppe_num >= 3 && target_mac->id == 2) {
-				target_mac->ppe_idx = 2;
-				gdm_config = soc->reg_map->gdma_to_ppe[2];
-			} else if (ppe_num >= 2 && target_mac->id == 1) {
-				target_mac->ppe_idx = 1;
-				gdm_config = soc->reg_map->gdma_to_ppe[1];
-			} else {
-				target_mac->ppe_idx = 0;
-				gdm_config = soc->reg_map->gdma_to_ppe[0];
-			}
-			mtk_gdm_config(eth, target_mac->id, gdm_config);
-		}
 
 		napi_enable(&eth->tx_napi);
 		napi_enable(&eth->rx_napi[0].napi);
@@ -4033,6 +4009,31 @@ static int mtk_open(struct net_device *dev)
 		refcount_set(&eth->dma_refcnt, 1);
 	} else {
 		refcount_inc(&eth->dma_refcnt);
+		/* dma_refcnt > 0 means other ports are active.
+		 * We must ensure this specific port's traffic is enabled,
+		 * because mtk_stop() now disables it explicitly.
+		 */
+	}
+
+	/* Always configure GDMA for this specific mac to ensure traffic flows */
+	{
+		const struct mtk_soc_data *soc = eth->soc;
+		u32 gdm_config;
+
+		if (!soc->offload_version) {
+			mac->ppe_idx = 0;
+			gdm_config = MTK_GDMA_TO_PDMA;
+		} else if (soc->ppe_num >= 3 && mac->id == 2) {
+			mac->ppe_idx = 2;
+			gdm_config = soc->reg_map->gdma_to_ppe[2];
+		} else if (soc->ppe_num >= 2 && mac->id == 1) {
+			mac->ppe_idx = 1;
+			gdm_config = soc->reg_map->gdma_to_ppe[1];
+		} else {
+			mac->ppe_idx = 0;
+			gdm_config = soc->reg_map->gdma_to_ppe[0];
+		}
+		mtk_gdm_config(eth, mac->id, gdm_config);
 	}
 
 	phylink_start(mac->phylink);
@@ -4114,6 +4115,9 @@ static int mtk_stop(struct net_device *dev)
 	netif_tx_disable(dev);
 
 	phylink_disconnect_phy(mac->phylink);
+
+	/* stop the specific mac directly to drain traffic */
+	mtk_gdm_config(eth, mac->id, MTK_GDMA_DROP_ALL);
 
 	/* only shutdown DMA if this is the last user */
 	if (!refcount_dec_and_test(&eth->dma_refcnt))
@@ -4811,31 +4815,89 @@ static int mtk_change_mtu(struct net_device *dev, int new_mtu)
 {
 	struct mtk_mac *mac = netdev_priv(dev);
 	struct mtk_eth *eth = mac->hw;
+	unsigned long restart = 0;
 	int i, length, max_mtu = 0;
+	int err = 0;
+	u32 new_rx_buf_len;
 
 	if (rcu_access_pointer(eth->prog) &&
-	    length > MTK_PP_MAX_BUF_SIZE) {
+	    new_mtu + MTK_RX_ETH_HLEN > MTK_PP_MAX_BUF_SIZE) {
 		netdev_err(dev, "Invalid MTU for XDP mode\n");
 		return -EINVAL;
 	}
 
-	WRITE_ONCE(dev->mtu, new_mtu);
+	if (test_bit(MTK_RESETTING, &eth->state)) {
+		netdev_warn(dev, "MTU change rejected: device is resetting\n");
+		return -EBUSY;
+	}
 
 	for (i = 0; i < MTK_MAX_DEVS; i++) {
 		if (!eth->netdev[i])
 			continue;
 
-		if (eth->netdev[i]->mtu > max_mtu)
-			max_mtu = eth->netdev[i]->mtu;
+		if (eth->netdev[i] == dev) {
+			if (new_mtu > max_mtu)
+				max_mtu = new_mtu;
+		} else {
+			if (eth->netdev[i]->mtu > max_mtu)
+				max_mtu = eth->netdev[i]->mtu;
+		}
 	}
 
 	length = max_mtu + MTK_RX_ETH_HLEN;
 	if (length <= MTK_MAX_RX_LENGTH)
-		eth->rx_buf_len = MTK_MAX_RX_LENGTH;
+		new_rx_buf_len = MTK_MAX_RX_LENGTH;
 	else if (length <= MTK_MAX_RX_LENGTH_2K)
-		eth->rx_buf_len = MTK_MAX_RX_LENGTH_2K;
+		new_rx_buf_len = MTK_MAX_RX_LENGTH_2K;
 	else if (length <= MTK_MAX_RX_LENGTH_9K)
-		eth->rx_buf_len = MTK_MAX_RX_LENGTH_9K;
+		new_rx_buf_len = MTK_MAX_RX_LENGTH_9K;
+	else
+		return -EINVAL;
+
+	if (new_rx_buf_len != eth->rx_buf_len) {
+		for (i = 0; i < MTK_MAX_DEVS; i++) {
+			if (!eth->netdev[i])
+				continue;
+
+			if (netif_running(eth->netdev[i]))
+				set_bit(i, &restart);
+		}
+
+		if (restart)
+			netdev_info(dev,
+				    "Coordinated restart to apply MTU/Buffer change\n");
+
+		for (i = 0; i < MTK_MAX_DEVS; i++) {
+			if (!eth->netdev[i] || !test_bit(i, &restart))
+				continue;
+			mtk_stop(eth->netdev[i]);
+		}
+
+		usleep_range(20000, 30000);
+
+		WRITE_ONCE(dev->mtu, new_mtu);
+		eth->rx_buf_len = new_rx_buf_len;
+
+		for (i = 0; i < MTK_MAX_DEVS; i++) {
+			int ret;
+
+			if (!eth->netdev[i] || !test_bit(i, &restart))
+				continue;
+
+			ret = mtk_open(eth->netdev[i]);
+			if (ret && !err)
+				err = ret;
+		}
+
+		if (err)
+			netdev_err(dev,
+				   "Failed to restart one or more ports after MTU change: %d\n",
+				   err);
+
+		return err;
+	}
+
+	WRITE_ONCE(dev->mtu, new_mtu);
 
 	return 0;
 }
