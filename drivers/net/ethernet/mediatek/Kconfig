@@ -41,4 +41,13 @@ config NET_MEDIATEK_STAR_EMAC
 	  This driver supports the ethernet MAC IP first used on
 	  MediaTek MT85** SoCs.
 
+config NET_MEDIATEK_PPE_HNAT
+	bool "MediaTek PPE Hardware NAT offload"
+	depends on NET_MEDIATEK_SOC
+	depends on NF_FLOW_TABLE
+	help
+	  This enables true zero-CPU Hardware NAT offload on MediaTek
+	  routers (e.g. BPI-R4 / MT7988) by installing Netfilter pre-routing hooks
+	  that bypass the software bridge and standard TC flow offload.
+
 endif #NET_VENDOR_MEDIATEK

@@ -32,6 +32,7 @@
 
 #include "mtk_eth_soc.h"
 #include "mtk_wed.h"
+#include "mtk_ppe_hnat.h"
 
 static int mtk_msg_level = -1;
 module_param_named(msg_level, mtk_msg_level, int, 0);
@@ -5355,11 +5356,16 @@ static int mtk_probe(struct platform_device *pdev)
 	schedule_delayed_work(&eth->reset.monitor_work,
 			      MTK_DMA_MONITOR_TIMEOUT);
 
+	if (eth->soc->offload_version)
+		mtk_ppe_hnat_init(eth);
+
 	return 0;
 
 err_unreg_netdev:
 	mtk_unreg_dev(eth);
 err_deinit_ppe:
+	if (eth->soc->offload_version)
+		mtk_ppe_hnat_exit();
 	mtk_ppe_deinit(eth);
 	mtk_mdio_cleanup(eth);
 err_free_dev:
@@ -5388,6 +5394,9 @@ static void mtk_remove(struct platform_device *pdev)
 		mac = netdev_priv(eth->netdev[i]);
 		phylink_disconnect_phy(mac->phylink);
 	}
+
+	if (eth->soc->offload_version)
+		mtk_ppe_hnat_exit();
 
 	mtk_wed_exit();
 	mtk_hw_deinit(eth);
