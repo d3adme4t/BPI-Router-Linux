@@ -44,7 +44,8 @@ config NET_MEDIATEK_STAR_EMAC
 config NET_MEDIATEK_PPE_HNAT
 	bool "MediaTek PPE Hardware NAT offload"
 	depends on NET_MEDIATEK_SOC
-	depends on NF_FLOW_TABLE
+	select NF_CONNTRACK
+	select NF_FLOW_TABLE
 	help
 	  This enables true zero-CPU Hardware NAT offload on MediaTek
 	  routers (e.g. BPI-R4 / MT7988) by installing Netfilter pre-routing hooks

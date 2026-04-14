@@ -381,6 +381,12 @@ int mtk_foe_entry_set_dsa(struct mtk_eth *eth, struct mtk_foe_entry *entry,
 
 	entry->ib1 &= ~mtk_get_ib1_vlan_tag_mask(eth);
 
+	if (mtk_is_netsys_v2_or_greater(eth)) {
+		u32 *ib2 = mtk_foe_entry_ib2(eth, entry);
+		*ib2 &= ~(MTK_FOE_IB2_DEST_PORT_V2 | MTK_FOE_IB2_MULTICAST_V2);
+		*ib2 |= FIELD_PREP(MTK_FOE_IB2_DEST_PORT_V2, port);
+	}
+
 	return 0;
 }
 

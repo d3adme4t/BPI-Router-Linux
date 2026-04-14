@@ -31,6 +31,9 @@ enum nf_ct_ext_id {
 #if IS_ENABLED(CONFIG_NET_ACT_CT)
 	NF_CT_EXT_ACT_CT,
 #endif
+#if IS_ENABLED(CONFIG_NET_MEDIATEK_PPE_HNAT)
+	NF_CT_EXT_PPE,
+#endif
 	NF_CT_EXT_NUM,
 };
 

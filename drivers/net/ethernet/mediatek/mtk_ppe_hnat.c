@@ -13,6 +13,7 @@
 #include <net/netfilter/nf_conntrack.h>
 #include <net/netfilter/nf_conntrack_core.h>
 #include <net/netfilter/nf_conntrack_ecache.h>
+#include <net/netfilter/nf_conntrack_ppe.h>
 #include <net/dsa.h>
 #include <net/dst.h>
 #include <net/neighbour.h>
@@ -25,7 +26,7 @@
 struct mtk_ppe_hnat {
 	struct mtk_eth *eth;
 #ifdef CONFIG_NF_CONNTRACK_EVENTS
-	struct nf_conntrack_notifier ct_nb;
+	struct nf_ct_event_notifier ct_nb;
 #endif
 };
 
@@ -39,6 +40,8 @@ static struct mtk_ppe_hnat *hnat_ctx;
 static int mtk_ppe_nf_ct_event(unsigned int events, const struct nf_ct_event *item)
 {
 	struct nf_conn *ct = item->ct;
+	struct nf_conn_ppe *ppe;
+	int i;
 
 	if (!hnat_ctx || !ct)
 		return 0;
@@ -46,23 +49,83 @@ static int mtk_ppe_nf_ct_event(unsigned int events, const struct nf_ct_event *it
 	if (!(events & (1 << IPCT_DESTROY)))
 		return 0;
 
-	/* Only care about entries we offloaded */
-	if (!test_bit(IPS_OFFLOAD_BIT, &ct->status))
+	ppe = nf_ct_ppe_find(ct);
+	if (!ppe)
 		return 0;
 
-	/*
-	 * The entry is on the PPE's foe_flow hlist. The PPE aging
-	 * mechanism will eventually invalidate the hardware slot and
-	 * call __mtk_foe_entry_clear(), which removes it from the
-	 * hlist and frees L2_SUBFLOW entries. For our L4 entries,
-	 * clear_bit is sufficient — the PPE garbage collector handles
-	 * the rest on next aging pass.
-	 */
-	clear_bit(IPS_OFFLOAD_BIT, &ct->status);
+	for (i = 0; i < IP_CT_DIR_MAX; i++) {
+		if (ppe->entries[i]) {
+			mtk_foe_entry_clear(hnat_ctx->eth->ppe[0], ppe->entries[i]);
+			kfree(ppe->entries[i]);
+			ppe->entries[i] = NULL;
+		}
+	}
 
 	return 0;
 }
 #endif
+
+static int mtk_ppe_resolve_path(struct mtk_eth *eth, struct mtk_foe_entry *foe,
+				struct net_device *dev, u8 *mac)
+{
+	struct net_device_path_stack stack;
+	struct net_device *lower;
+	struct list_head *iter;
+	struct dsa_port *dp;
+	int i;
+
+	/*
+	 * Primary path: walk the full forwarding path stack. Works for direct
+	 * DSA slaves (e.g. wan, lan3) and for bridge devices when the FDB has
+	 * already learned the destination MAC (i.e. established LAN flows).
+	 */
+	if (!dev_fill_forward_path(dev, mac, &stack)) {
+		for (i = 0; i < stack.num_paths; i++) {
+			struct net_device_path *path = &stack.path[i];
+
+			if (path->type == DEV_PATH_DSA) {
+				pr_debug("PPE resolve: dev=%s DSA port=%d (path)\n",
+					 dev->name, path->dsa.port);
+				mtk_foe_entry_set_dsa(eth, foe, path->dsa.port);
+			} else if (path->type == DEV_PATH_VLAN) {
+				mtk_foe_entry_set_vlan(eth, foe, path->encap.id);
+			}
+		}
+		return 0;
+	}
+
+	/*
+	 * Bridge fallback: dev_fill_forward_path() fails when the bridge FDB
+	 * has no entry for the destination MAC, which happens in the REPLY
+	 * direction when state->in is br0 and the destination is a WAN-side
+	 * MAC not learned by the LAN bridge.
+	 *
+	 * In this case, pick the first active DSA slave of the bridge. The
+	 * MT7531 switch handles within-LAN forwarding in hardware, so any
+	 * active member port is a valid egress for PPE purposes.
+	 */
+	if (!netif_is_bridge_master(dev))
+		return -EINVAL;
+
+	rcu_read_lock();
+	netdev_for_each_lower_dev(dev, lower, iter) {
+		if (!dsa_user_dev_check(lower))
+			continue;
+		if (!netif_running(lower) || !netif_carrier_ok(lower))
+			continue;
+		dp = dsa_port_from_netdev(lower);
+		if (IS_ERR_OR_NULL(dp))
+			continue;
+		pr_debug("PPE resolve: dev=%s bridge fallback DSA port=%d (via %s)\n",
+			 dev->name, dp->index, lower->name);
+		mtk_foe_entry_set_dsa(eth, foe, dp->index);
+		rcu_read_unlock();
+		return 0;
+	}
+	rcu_read_unlock();
+
+	return -ENODEV;
+}
 
 static unsigned int mtk_ppe_nf_hook(void *priv, struct sk_buff *skb,
 				    const struct nf_hook_state *state)
@@ -70,14 +133,13 @@ static unsigned int mtk_ppe_nf_hook(void *priv, struct sk_buff *skb,
 	struct mtk_eth *eth = hnat_ctx->eth;
 	struct nf_conn *ct;
 	enum ip_conntrack_info ctinfo;
-	struct mtk_flow_entry *entry;
-	struct mtk_foe_entry *foe;
+	struct nf_conn_ppe *ppe;
+	struct mtk_flow_entry *entries[2] = { NULL, NULL };
 	struct net_device *in_dev = state->in;
 	struct net_device *out_dev = state->out;
-	int type, l4proto;
-	u8 pse_port = 1; /* default GMAC1 */
-	u8 dest_mac[ETH_ALEN];
-	u8 src_mac[ETH_ALEN];
+	int i, l4proto;
+	u8 pse_port = 1; /* GMAC1 / Switch */
+	u8 dest_mac[2][ETH_ALEN];
 	struct dst_entry *dst;
 	struct neighbour *n;
 	bool is_ipv4 = false;
@@ -86,39 +148,44 @@ static unsigned int mtk_ppe_nf_hook(void *priv, struct sk_buff *skb,
 		return NF_ACCEPT;
 
 	ct = nf_ct_get(skb, &ctinfo);
-	if (!ct || !nf_ct_is_confirmed(ct))
+	if (!ct)
 		return NF_ACCEPT;
 
-#ifdef CONFIG_NF_CONNTRACK_EVENTS
-	/* Only offload each conntrack once — prevents duplicate entry flooding */
-	if (test_and_set_bit(IPS_OFFLOAD_BIT, &ct->status))
+	/* Pre-allocate extension if missing */
+	ppe = nf_ct_ppe_find(ct);
+	if (!ppe) {
+		if (nf_ct_is_confirmed(ct))
+			return NF_ACCEPT;
+		ppe = nf_ct_ext_add(ct, NF_CT_EXT_PPE, GFP_ATOMIC);
 		return NF_ACCEPT;
-#endif
+	}
 
-	if (ctinfo != IP_CT_ESTABLISHED && ctinfo != IP_CT_ESTABLISHED_REPLY)
-		goto clear_offload;
+	/* Skip if already offloaded or not yet assured */
+	if (ppe->entries[0] || ppe->entries[1])
+		return NF_ACCEPT;
+
+	if (!test_bit(IPS_ASSURED_BIT, &ct->status))
+		return NF_ACCEPT;
 
 	if (skb->protocol == htons(ETH_P_IP)) {
 		struct iphdr *iph = ip_hdr(skb);
 		l4proto = iph->protocol;
 		if (l4proto != IPPROTO_TCP && l4proto != IPPROTO_UDP)
-			goto clear_offload;
-		type = MTK_PPE_PKT_TYPE_IPV4_HNAPT;
+			return NF_ACCEPT;
 		is_ipv4 = true;
 	} else if (skb->protocol == htons(ETH_P_IPV6)) {
 		struct ipv6hdr *ip6h = ipv6_hdr(skb);
 		l4proto = ip6h->nexthdr;
 		if (l4proto != IPPROTO_TCP && l4proto != IPPROTO_UDP)
-			goto clear_offload;
-		type = MTK_PPE_PKT_TYPE_IPV6_ROUTE_5T;
+			return NF_ACCEPT;
 	} else {
-		goto clear_offload;
+		return NF_ACCEPT;
 	}
 
-	/* Resolve next-hop MAC via neighbour subsystem */
+	/* Resolve Forward Direction MAC */
 	dst = skb_dst(skb);
 	if (!dst)
-		goto clear_offload;
+		return NF_ACCEPT;
 
 	if (is_ipv4)
 		n = dst_neigh_lookup(dst, &ip_hdr(skb)->daddr);
@@ -126,109 +193,85 @@ static unsigned int mtk_ppe_nf_hook(void *priv, struct sk_buff *skb,
 		n = dst_neigh_lookup(dst, &ipv6_hdr(skb)->daddr);
 
 	if (!n)
-		goto clear_offload;
+		return NF_ACCEPT;
 
-	/* Read neighbour MAC under lock, reject incomplete ARP/NDP entries */
 	read_lock_bh(&n->lock);
 	if (!(n->nud_state & NUD_VALID)) {
 		read_unlock_bh(&n->lock);
 		neigh_release(n);
-		goto clear_offload;
+		return NF_ACCEPT;
 	}
-	memcpy(dest_mac, n->ha, ETH_ALEN);
+	memcpy(dest_mac[0], n->ha, ETH_ALEN);
 	read_unlock_bh(&n->lock);
 	neigh_release(n);
 
-	memcpy(src_mac, out_dev->dev_addr, ETH_ALEN);
+	/* Use original skb source MAC for Reply Direction dest_mac */
+	memcpy(dest_mac[1], eth_hdr(skb)->h_source, ETH_ALEN);
 
-	/* Determine PSE destination port */
-	if (eth->netdev[1] &&
-	    out_dev->ifindex == eth->netdev[1]->ifindex)
-		pse_port = 2; /* GMAC2 */
+	/* Resolve both directions */
+	for (i = 0; i < IP_CT_DIR_MAX; i++) {
+		struct mtk_foe_entry *foe;
+		struct net_device *tdev = i == 0 ? out_dev : in_dev;
+		int type;
 
-	entry = kzalloc(sizeof(*entry), GFP_ATOMIC);
-	if (!entry)
-		goto clear_offload;
+		entries[i] = kzalloc(sizeof(*entries[i]), GFP_ATOMIC);
+		if (!entries[i])
+			goto err_out;
 
-	entry->type = MTK_FLOW_TYPE_L4;
-	foe = &entry->data;
+		entries[i]->type = MTK_FLOW_TYPE_L4;
+		foe = &entries[i]->data;
 
-	mtk_foe_entry_prepare(eth, foe, type, l4proto, pse_port,
-			      src_mac, dest_mac);
+		type = is_ipv4 ? MTK_PPE_PKT_TYPE_IPV4_HNAPT :
+				 MTK_PPE_PKT_TYPE_IPV6_ROUTE_5T;
 
-	if (is_ipv4) {
-		if (CTINFO2DIR(ctinfo) == IP_CT_DIR_ORIGINAL) {
+		mtk_foe_entry_prepare(eth, foe, type, l4proto, pse_port,
+				      (u8 *)tdev->dev_addr, dest_mac[i]);
+
+		if (is_ipv4) {
+			int dir = (i == 0) ? IP_CT_DIR_ORIGINAL : IP_CT_DIR_REPLY;
+			int rev = (i == 0) ? IP_CT_DIR_REPLY : IP_CT_DIR_ORIGINAL;
+
 			mtk_foe_entry_set_ipv4_tuple(eth, foe, false,
-				ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.u3.ip,
-				ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.u.all,
-				ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.dst.u3.ip,
-				ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.dst.u.all);
+				ct->tuplehash[dir].tuple.src.u3.ip,
+				ct->tuplehash[dir].tuple.src.u.all,
+				ct->tuplehash[dir].tuple.dst.u3.ip,
+				ct->tuplehash[dir].tuple.dst.u.all);
 
 			mtk_foe_entry_set_ipv4_tuple(eth, foe, true,
-				ct->tuplehash[IP_CT_DIR_REPLY].tuple.dst.u3.ip,
-				ct->tuplehash[IP_CT_DIR_REPLY].tuple.dst.u.all,
-				ct->tuplehash[IP_CT_DIR_REPLY].tuple.src.u3.ip,
-				ct->tuplehash[IP_CT_DIR_REPLY].tuple.src.u.all);
+				ct->tuplehash[rev].tuple.dst.u3.ip,
+				ct->tuplehash[rev].tuple.dst.u.all,
+				ct->tuplehash[rev].tuple.src.u3.ip,
+				ct->tuplehash[rev].tuple.src.u.all);
 		} else {
-			mtk_foe_entry_set_ipv4_tuple(eth, foe, false,
-				ct->tuplehash[IP_CT_DIR_REPLY].tuple.src.u3.ip,
-				ct->tuplehash[IP_CT_DIR_REPLY].tuple.src.u.all,
-				ct->tuplehash[IP_CT_DIR_REPLY].tuple.dst.u3.ip,
-				ct->tuplehash[IP_CT_DIR_REPLY].tuple.dst.u.all);
+			int dir = (i == 0) ? IP_CT_DIR_ORIGINAL : IP_CT_DIR_REPLY;
 
-			mtk_foe_entry_set_ipv4_tuple(eth, foe, true,
-				ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.dst.u3.ip,
-				ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.dst.u.all,
-				ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.u3.ip,
-				ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.u.all);
-		}
-	} else {
-		if (CTINFO2DIR(ctinfo) == IP_CT_DIR_ORIGINAL) {
 			mtk_foe_entry_set_ipv6_tuple(eth, foe,
-				ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.u3.in6.s6_addr32,
-				ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.u.all,
-				ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.dst.u3.in6.s6_addr32,
-				ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.dst.u.all);
-		} else {
-			mtk_foe_entry_set_ipv6_tuple(eth, foe,
-				ct->tuplehash[IP_CT_DIR_REPLY].tuple.src.u3.in6.s6_addr32,
-				ct->tuplehash[IP_CT_DIR_REPLY].tuple.src.u.all,
-				ct->tuplehash[IP_CT_DIR_REPLY].tuple.dst.u3.in6.s6_addr32,
-				ct->tuplehash[IP_CT_DIR_REPLY].tuple.dst.u.all);
+				ct->tuplehash[dir].tuple.src.u3.in6.s6_addr32,
+				ct->tuplehash[dir].tuple.src.u.all,
+				ct->tuplehash[dir].tuple.dst.u3.in6.s6_addr32,
+				ct->tuplehash[dir].tuple.dst.u.all);
 		}
-	}
 
-	/* Resolve DSA/VLAN paths AFTER tuple setup so l2->etype isn't overwritten */
-#if IS_ENABLED(CONFIG_NET_DSA)
-	{
-		struct net_device_path_stack stack;
+		if (mtk_ppe_resolve_path(eth, foe, tdev, dest_mac[i]))
+			goto err_out;
 
-		rcu_read_lock();
-		if (dev_fill_forward_path(out_dev, dest_mac, &stack) == 0) {
-			int i;
-			for (i = 0; i < stack.num_paths; i++) {
-				struct net_device_path *path = &stack.path[i];
-				if (path->type == DEV_PATH_DSA)
-					mtk_foe_entry_set_dsa(eth, foe, path->dsa.port);
-				else if (path->type == DEV_PATH_VLAN)
-					mtk_foe_entry_set_vlan(eth, foe, path->encap.id);
-			}
-		}
-		rcu_read_unlock();
-	}
-#endif
+		if (mtk_foe_entry_commit(eth->ppe[0], entries[i]))
+			goto err_out;
 
-	if (mtk_foe_entry_commit(eth->ppe[0], entry)) {
-		kfree(entry);
-		goto clear_offload;
+		ppe->entries[i] = entries[i];
 	}
 
 	return NF_ACCEPT;
 
-clear_offload:
-#ifdef CONFIG_NF_CONNTRACK_EVENTS
-	clear_bit(IPS_OFFLOAD_BIT, &ct->status);
-#endif
+err_out:
+	for (i = 0; i < IP_CT_DIR_MAX; i++) {
+		if (entries[i]) {
+			if (ppe->entries[i] == entries[i])
+				ppe->entries[i] = NULL;
+			mtk_foe_entry_clear(eth->ppe[0], entries[i]);
+			kfree(entries[i]);
+		}
+	}
 	return NF_ACCEPT;
 }
 
@@ -260,19 +303,18 @@ int mtk_ppe_hnat_init(struct mtk_eth *eth)
 #ifdef CONFIG_NF_CONNTRACK_EVENTS
 	/* Register conntrack event notifier for flow cleanup */
 	hnat_ctx->ct_nb.ct_event = mtk_ppe_nf_ct_event;
-	ret = nf_conntrack_register_notifier(&init_net, &hnat_ctx->ct_nb);
-	if (ret) {
-		kfree(hnat_ctx);
-		hnat_ctx = NULL;
-		return ret;
-	}
+	nf_conntrack_register_notifier(&init_net, &hnat_ctx->ct_nb);
 #endif
 
+	/* Register on init_net only — this driver targets dedicated router
+	 * hardware (BPI-R4/MT7988A) where network namespaces are not used.
+	 * Multi-namespace support can be added if needed.
+	 */
 	ret = nf_register_net_hooks(&init_net, mtk_ppe_nf_ops,
 				    ARRAY_SIZE(mtk_ppe_nf_ops));
 	if (ret) {
 #ifdef CONFIG_NF_CONNTRACK_EVENTS
-		nf_conntrack_unregister_notifier(&init_net, &hnat_ctx->ct_nb);
+		nf_conntrack_unregister_notifier(&init_net);
 #endif
 		kfree(hnat_ctx);
 		hnat_ctx = NULL;
@@ -289,7 +331,7 @@ void mtk_ppe_hnat_exit(void)
 		nf_unregister_net_hooks(&init_net, mtk_ppe_nf_ops,
 					ARRAY_SIZE(mtk_ppe_nf_ops));
 #ifdef CONFIG_NF_CONNTRACK_EVENTS
-		nf_conntrack_unregister_notifier(&init_net, &hnat_ctx->ct_nb);
+		nf_conntrack_unregister_notifier(&init_net);
 #endif
 		kfree(hnat_ctx);
 		hnat_ctx = NULL;

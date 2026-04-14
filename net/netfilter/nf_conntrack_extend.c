@@ -24,6 +24,7 @@
 #include <net/netfilter/nf_conntrack_synproxy.h>
 #include <net/netfilter/nf_conntrack_act_ct.h>
 #include <net/netfilter/nf_nat.h>
+#include <net/netfilter/nf_conntrack_ppe.h>
 
 #define NF_CT_EXT_PREALLOC	128u /* conntrack events are on by default */
 
@@ -54,12 +55,15 @@ static const u8 nf_ct_ext_type_len[NF_CT_EXT_NUM] = {
 #if IS_ENABLED(CONFIG_NET_ACT_CT)
 	[NF_CT_EXT_ACT_CT] = sizeof(struct nf_conn_act_ct_ext),
 #endif
+#if IS_ENABLED(CONFIG_NET_MEDIATEK_PPE_HNAT)
+	[NF_CT_EXT_PPE] = sizeof(struct nf_conn_ppe),
+#endif
 };
 
 static __always_inline unsigned int total_extension_size(void)
 {
 	/* remember to add new extensions below */
-	BUILD_BUG_ON(NF_CT_EXT_NUM > 10);
+	BUILD_BUG_ON(NF_CT_EXT_NUM > 15);
 
 	return sizeof(struct nf_ct_ext) +
 	       sizeof(struct nf_conn_help)
@@ -85,6 +89,9 @@ static __always_inline unsigned int total_extension_size(void)
 #endif
 #if IS_ENABLED(CONFIG_NET_ACT_CT)
 		+ sizeof(struct nf_conn_act_ct_ext)
+#endif
+#if IS_ENABLED(CONFIG_NET_MEDIATEK_PPE_HNAT)
+		+ sizeof(struct nf_conn_ppe)
 #endif
 	;
 }
