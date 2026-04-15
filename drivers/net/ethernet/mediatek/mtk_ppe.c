@@ -98,6 +98,20 @@ static int mtk_mib_entry_read(struct mtk_ppe *ppe, u16 index, u64 *bytes, u64 *p
 	u32 val, cnt_r0, cnt_r1, cnt_r2;
 	int ret;
 
+	/* Flush MIB cache to commit accumulated counters to the MIB table.
+	 * Without this, the serial read interface returns zeros even for
+	 * active BIND entries. MTK_PPE_MIB_CACHE_CTL_FLUSH is a self-clearing
+	 * trigger bit — poll until it clears before issuing the serial read.
+	 */
+	ppe_m32(ppe, MTK_PPE_MIB_CACHE_CTL, MTK_PPE_MIB_CACHE_CTL_FLUSH,
+		MTK_PPE_MIB_CACHE_CTL_FLUSH);
+
+	ret = readl_poll_timeout_atomic(ppe->base + MTK_PPE_MIB_CACHE_CTL, val,
+					!(val & MTK_PPE_MIB_CACHE_CTL_FLUSH),
+					1, 10);
+	if (ret)
+		dev_warn_ratelimited(ppe->dev, "MIB cache flush timeout\n");
+
 	val = FIELD_PREP(MTK_PPE_MIB_SER_CR_ADDR, index) | MTK_PPE_MIB_SER_CR_ST;
 	ppe_w32(ppe, MTK_PPE_MIB_SER_CR, val);
 
