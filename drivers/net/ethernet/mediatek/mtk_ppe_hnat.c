@@ -37,7 +37,8 @@ static struct mtk_ppe_hnat *hnat_ctx;
  * Conntrack destroy notifier — clean up our FOE entry when the
  * conntrack dies, preventing memory leaks.
  */
-static int mtk_ppe_nf_ct_event(unsigned int events, const struct nf_ct_event *item)
+static int mtk_ppe_nf_ct_event(unsigned int events,
+			       const struct nf_ct_event *item)
 {
 	struct nf_conn *ct = item->ct;
 	struct nf_conn_ppe *ppe;
@@ -55,7 +56,8 @@ static int mtk_ppe_nf_ct_event(unsigned int events, const struct nf_ct_event *it
 
 	for (i = 0; i < IP_CT_DIR_MAX; i++) {
 		if (ppe->entries[i]) {
-			mtk_foe_entry_clear(hnat_ctx->eth->ppe[0], ppe->entries[i]);
+			mtk_foe_entry_clear(hnat_ctx->eth->ppe[0],
+					    ppe->entries[i]);
 			kfree(ppe->entries[i]);
 			ppe->entries[i] = NULL;
 		}
@@ -64,67 +66,108 @@ static int mtk_ppe_nf_ct_event(unsigned int events, const struct nf_ct_event *it
 	return 0;
 }
 #endif
-
+/*
+ * Resolve the egress path for a FOE entry and program the three mandatory
+ * hardware fields that the PPE requires to forward a packet:
+ *
+ *   1. DSA tag   — written to etype via mtk_foe_entry_set_dsa()
+ *   2. TX queue  — written to ib2.QID via mtk_foe_entry_set_queue()
+ *   3. PSE port  — written to ib2.PSE_PORT via mtk_foe_entry_set_pse_port()
+ *
+ * Mirrors mtk_flow_set_output_device() from mtk_ppe_offload.c.
+ *
+ * DSA port vs PSE port — they are different things:
+ *   DSA port (0-6):  MT7531 switch port index, encoded in etype as BIT(port)
+ *   PSE port (0-2):  GMAC egress selector in the FOE entry
+ *                    (PSE_GDM1_PORT=0, PSE_GDM2_PORT=1, PSE_GDM3_PORT=2)
+ *
+ * mtk_foe_entry_set_dsa() overwrites ib2.DEST_PORT_V2 with the DSA port
+ * index, so mtk_foe_entry_set_pse_port() MUST be called afterwards to
+ * restore the correct GMAC port in that field.
+ */
 static int mtk_ppe_resolve_path(struct mtk_eth *eth, struct mtk_foe_entry *foe,
-				struct net_device *dev, u8 *mac)
+				struct net_device *dev, const u8 *dest_mac)
 {
-	struct net_device_path_stack stack;
+	struct net_device *conduit = NULL;
 	struct net_device *lower;
 	struct list_head *iter;
 	struct dsa_port *dp;
-	int i;
+	int dsa_port_idx = -1;
+	int pse_port, queue;
 
 	/*
-	 * Primary path: walk the full forwarding path stack. Works for direct
-	 * DSA slaves (e.g. wan, lan3) and for bridge devices when the FDB has
-	 * already learned the destination MAC (i.e. established LAN flows).
+	 * Case 1: dev is already a DSA user port (wan, lan1, lan2, ...).
+	 * Obtain the conduit (eth0/GMAC1) directly from the dsa_port.
 	 */
-	if (!dev_fill_forward_path(dev, mac, &stack)) {
-		for (i = 0; i < stack.num_paths; i++) {
-			struct net_device_path *path = &stack.path[i];
-
-			if (path->type == DEV_PATH_DSA) {
-				pr_debug("PPE resolve: dev=%s DSA port=%d (path)\n",
-					 dev->name, path->dsa.port);
-				mtk_foe_entry_set_dsa(eth, foe, path->dsa.port);
-			} else if (path->type == DEV_PATH_VLAN) {
-				mtk_foe_entry_set_vlan(eth, foe, path->encap.id);
-			}
+	if (dsa_user_dev_check(dev)) {
+		dp = dsa_port_from_netdev(dev);
+		if (!IS_ERR_OR_NULL(dp) &&
+		    dp->cpu_dp->tag_ops->proto == DSA_TAG_PROTO_MTK) {
+			dsa_port_idx = dp->index;
+			conduit = dsa_port_to_conduit(dp);
 		}
-		return 0;
-	}
 
 	/*
-	 * Bridge fallback: dev_fill_forward_path() fails when the bridge FDB
-	 * has no entry for the destination MAC, which happens in the REPLY
-	 * direction when state->in is br0 and the destination is a WAN-side
-	 * MAC not learned by the LAN bridge.
+	 * Case 2: dev is a bridge (br0). Walk its lower devices to find a
+	 * DSA slave that uses the MTK tag protocol. The first active member
+	 * is used — the MT7531 switch handles within-LAN L2 forwarding in
+	 * hardware, so any member port is a valid HNAT egress target.
 	 *
-	 * In this case, pick the first active DSA slave of the bridge. The
-	 * MT7531 switch handles within-LAN forwarding in hardware, so any
-	 * active member port is a valid egress for PPE purposes.
+	 * Note: netdev_for_each_lower_dev() is safe without an explicit
+	 * rcu_read_lock() here because NF_INET_FORWARD hooks already execute
+	 * within an RCU read-side critical section.
 	 */
-	if (!netif_is_bridge_master(dev))
-		return -EINVAL;
-
-	rcu_read_lock();
-	netdev_for_each_lower_dev(dev, lower, iter) {
-		if (!dsa_user_dev_check(lower))
-			continue;
-		if (!netif_running(lower) || !netif_carrier_ok(lower))
-			continue;
-		dp = dsa_port_from_netdev(lower);
-		if (IS_ERR_OR_NULL(dp))
-			continue;
-		pr_debug("PPE resolve: dev=%s bridge fallback DSA port=%d (via %s)\n",
-			 dev->name, dp->index, lower->name);
-		mtk_foe_entry_set_dsa(eth, foe, dp->index);
-		rcu_read_unlock();
-		return 0;
+	} else {
+		netdev_for_each_lower_dev(dev, lower, iter) {
+			if (!dsa_user_dev_check(lower))
+				continue;
+			dp = dsa_port_from_netdev(lower);
+			if (IS_ERR_OR_NULL(dp))
+				continue;
+			if (dp->cpu_dp->tag_ops->proto != DSA_TAG_PROTO_MTK)
+				continue;
+			dsa_port_idx = dp->index;
+			conduit = dsa_port_to_conduit(dp);
+			break;
+		}
 	}
-	rcu_read_unlock();
 
-	return -ENODEV;
+	if (!conduit || dsa_port_idx < 0)
+		return -EOPNOTSUPP;
+
+	/*
+	 * Map the conduit device to its PSE GMAC port number.
+	 * dsa_port_to_conduit() replaced the DSA slave with the GMAC netdev
+	 * (e.g. eth0), which is the one that appears in eth->netdev[].
+	 */
+	if (conduit == eth->netdev[0])
+		pse_port = PSE_GDM1_PORT;
+	else if (conduit == eth->netdev[1])
+		pse_port = PSE_GDM2_PORT;
+	else if (conduit == eth->netdev[2])
+		pse_port = PSE_GDM3_PORT;
+	else
+		return -EOPNOTSUPP;
+
+	/* Program DSA tag into etype/ib2 — clobbers ib2.DEST_PORT_V2. */
+	mtk_foe_entry_set_dsa(eth, foe, dsa_port_idx);
+
+	/* DSA TX queues are offset by 3 from the DSA port index. */
+	queue = 3 + dsa_port_idx;
+	mtk_foe_entry_set_queue(eth, foe, queue);
+
+	/*
+	 * Restore PSE GMAC port in ib2 — must come after set_dsa() since
+	 * set_dsa() writes the DSA port index into ib2.DEST_PORT_V2,
+	 * overwriting the value set by mtk_foe_entry_prepare(). Without this
+	 * call the PPE has no valid egress target and silently drops every
+	 * matched packet (packets=0, bytes=0 on all BIND entries).
+	 */
+	mtk_foe_entry_set_pse_port(eth, foe, pse_port);
+
+	pr_debug("PPE resolve: dev=%s conduit=%s dsa=%d pse=%d queue=%d\n",
+		 dev->name, conduit->name, dsa_port_idx, pse_port, queue);
+	return 0;
 }
 
 static unsigned int mtk_ppe_nf_hook(void *priv, struct sk_buff *skb,
@@ -138,7 +181,8 @@ static unsigned int mtk_ppe_nf_hook(void *priv, struct sk_buff *skb,
 	struct net_device *in_dev = state->in;
 	struct net_device *out_dev = state->out;
 	int i, l4proto;
-	u8 pse_port = 1; /* GMAC1 / Switch */
+	/* PSE port is set by mtk_ppe_resolve_path(); use neutral default here */
+	u8 pse_port = PSE_GDM1_PORT;
 	u8 dest_mac[2][ETH_ALEN];
 	struct dst_entry *dst;
 	struct neighbour *n;
@@ -160,10 +204,10 @@ static unsigned int mtk_ppe_nf_hook(void *priv, struct sk_buff *skb,
 		return NF_ACCEPT;
 	}
 
-	/* Skip if already offloaded or not yet assured */
-	if (ppe->entries[0] || ppe->entries[1])
-		return NF_ACCEPT;
-
+	/* Only offload assured, TCP/UDP flows. Check these before claiming
+	 * the atomic bit so a flow that isn't ready yet remains claimable
+	 * on a future packet once conditions are met.
+	 */
 	if (!test_bit(IPS_ASSURED_BIT, &ct->status))
 		return NF_ACCEPT;
 
@@ -181,6 +225,20 @@ static unsigned int mtk_ppe_nf_hook(void *priv, struct sk_buff *skb,
 	} else {
 		return NF_ACCEPT;
 	}
+
+	/*
+	 * Atomically claim this conntrack for hardware offload. Only the
+	 * first CPU to succeed proceeds to create FOE entries; all others
+	 * (including retries on the same CPU) return immediately.
+	 * err_out clears this bit if entry creation fails, allowing retry.
+	 */
+	if (test_and_set_bit(IPS_HW_OFFLOAD_BIT, &ct->status))
+		return NF_ACCEPT;
+
+	/* Safety check: entries already populated means we somehow raced
+	 * past the bit guard. Leave the bit set (flow is offloaded). */
+	if (ppe->entries[0] || ppe->entries[1])
+		return NF_ACCEPT;
 
 	/* Resolve Forward Direction MAC */
 	dst = skb_dst(skb);
@@ -228,24 +286,30 @@ static unsigned int mtk_ppe_nf_hook(void *priv, struct sk_buff *skb,
 				      (u8 *)tdev->dev_addr, dest_mac[i]);
 
 		if (is_ipv4) {
-			int dir = (i == 0) ? IP_CT_DIR_ORIGINAL : IP_CT_DIR_REPLY;
-			int rev = (i == 0) ? IP_CT_DIR_REPLY : IP_CT_DIR_ORIGINAL;
+			int dir = (i == 0) ? IP_CT_DIR_ORIGINAL :
+					     IP_CT_DIR_REPLY;
+			int rev = (i == 0) ? IP_CT_DIR_REPLY :
+					     IP_CT_DIR_ORIGINAL;
 
-			mtk_foe_entry_set_ipv4_tuple(eth, foe, false,
+			mtk_foe_entry_set_ipv4_tuple(
+				eth, foe, false,
 				ct->tuplehash[dir].tuple.src.u3.ip,
 				ct->tuplehash[dir].tuple.src.u.all,
 				ct->tuplehash[dir].tuple.dst.u3.ip,
 				ct->tuplehash[dir].tuple.dst.u.all);
 
-			mtk_foe_entry_set_ipv4_tuple(eth, foe, true,
+			mtk_foe_entry_set_ipv4_tuple(
+				eth, foe, true,
 				ct->tuplehash[rev].tuple.dst.u3.ip,
 				ct->tuplehash[rev].tuple.dst.u.all,
 				ct->tuplehash[rev].tuple.src.u3.ip,
 				ct->tuplehash[rev].tuple.src.u.all);
 		} else {
-			int dir = (i == 0) ? IP_CT_DIR_ORIGINAL : IP_CT_DIR_REPLY;
+			int dir = (i == 0) ? IP_CT_DIR_ORIGINAL :
+					     IP_CT_DIR_REPLY;
 
-			mtk_foe_entry_set_ipv6_tuple(eth, foe,
+			mtk_foe_entry_set_ipv6_tuple(
+				eth, foe,
 				ct->tuplehash[dir].tuple.src.u3.in6.s6_addr32,
 				ct->tuplehash[dir].tuple.src.u.all,
 				ct->tuplehash[dir].tuple.dst.u3.in6.s6_addr32,
@@ -264,6 +328,13 @@ static unsigned int mtk_ppe_nf_hook(void *priv, struct sk_buff *skb,
 	return NF_ACCEPT;
 
 err_out:
+	/*
+	 * Clear IPS_HW_OFFLOAD_BIT so the flow can be retried on a future
+	 * packet. If we leave it set after a failed commit, the atomic guard
+	 * at the top of this function permanently blocks this conntrack from
+	 * ever being offloaded.
+	 */
+	clear_bit(IPS_HW_OFFLOAD_BIT, &ct->status);
 	for (i = 0; i < IP_CT_DIR_MAX; i++) {
 		if (entries[i]) {
 			if (ppe->entries[i] == entries[i])
@@ -277,16 +348,16 @@ err_out:
 
 static struct nf_hook_ops mtk_ppe_nf_ops[] = {
 	{
-		.hook		= mtk_ppe_nf_hook,
-		.pf		= NFPROTO_IPV4,
-		.hooknum	= NF_INET_FORWARD,
-		.priority	= NF_IP_PRI_LAST,
+		.hook = mtk_ppe_nf_hook,
+		.pf = NFPROTO_IPV4,
+		.hooknum = NF_INET_FORWARD,
+		.priority = NF_IP_PRI_LAST,
 	},
 	{
-		.hook		= mtk_ppe_nf_hook,
-		.pf		= NFPROTO_IPV6,
-		.hooknum	= NF_INET_FORWARD,
-		.priority	= NF_IP_PRI_LAST,
+		.hook = mtk_ppe_nf_hook,
+		.pf = NFPROTO_IPV6,
+		.hooknum = NF_INET_FORWARD,
+		.priority = NF_IP_PRI_LAST,
 	},
 };
 
