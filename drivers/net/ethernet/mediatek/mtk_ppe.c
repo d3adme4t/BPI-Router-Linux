@@ -1077,7 +1077,7 @@ void mtk_ppe_start(struct mtk_ppe *ppe)
 		ppe_m32(ppe, MTK_PPE_MIB_CFG, MTK_PPE_MIB_CFG_RD_CLR,
 			MTK_PPE_MIB_CFG_RD_CLR);
 		ppe_m32(ppe, MTK_PPE_MIB_CACHE_CTL, MTK_PPE_MIB_CACHE_CTL_EN,
-			MTK_PPE_MIB_CFG_RD_CLR);
+			MTK_PPE_MIB_CACHE_CTL_EN);
 	}
 }
 
