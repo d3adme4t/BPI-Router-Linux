@@ -3483,6 +3483,8 @@ static void mtk_gdm_config(struct mtk_eth *eth, u32 id, u32 config)
 		val |= MTK_GDMA_SPECIAL_TAG;
 
 	mtk_w32(eth, val, MTK_GDMA_FWD_CFG(id));
+	pr_info("mtk_gdm_config: GMAC%u MTK_GDMA_FWD_CFG wrote 0x%08x (readback 0x%08x)\n",
+		id, val, mtk_r32(eth, MTK_GDMA_FWD_CFG(id)));
 }
 
 
@@ -3587,6 +3589,8 @@ static int mtk_open(struct net_device *dev)
 				target_mac->ppe_idx = 0;
 				gdm_config = soc->reg_map->gdma_to_ppe[0];
 			}
+			pr_info("mtk_open: GMAC%u -> ppe_idx=%u gdm_config=0x%08x\n",
+				target_mac->id, target_mac->ppe_idx, gdm_config);
 			mtk_gdm_config(eth, target_mac->id, gdm_config);
 		}
 
