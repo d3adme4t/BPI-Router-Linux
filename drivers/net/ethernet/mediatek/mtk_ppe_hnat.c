@@ -79,7 +79,7 @@ static int mtk_ppe_nf_ct_event(unsigned int events,
  * DSA port vs PSE port — they are different things:
  *   DSA port (0-6):  MT7531 switch port index, encoded in etype as BIT(port)
  *   PSE port (0-2):  GMAC egress selector in the FOE entry
- *                    (PSE_GDM1_PORT=0, PSE_GDM2_PORT=1, PSE_GDM3_PORT=2)
+ *                    (PSE_GDM1_PORT=1, PSE_GDM2_PORT=2, PSE_GDM3_PORT=15)
  *
  * mtk_foe_entry_set_dsa() overwrites ib2.DEST_PORT_V2 with the DSA port
  * index, so mtk_foe_entry_set_pse_port() MUST be called afterwards to
@@ -136,18 +136,27 @@ static int mtk_ppe_resolve_path(struct mtk_eth *eth, struct mtk_foe_entry *foe,
 		return -EOPNOTSUPP;
 
 	/*
-	 * Map the conduit device to its PSE GMAC port number.
-	 * dsa_port_to_conduit() replaced the DSA slave with the GMAC netdev
-	 * (e.g. eth0), which is the one that appears in eth->netdev[].
+	 * Map the conduit's GMAC index to its PSE port number.
+	 *
+	 * Using netdev_priv(conduit)->id instead of pointer comparison
+	 * (conduit == eth->netdev[x]) because dsa_port_to_conduit() may
+	 * return a pointer that doesn't match eth->netdev[] entries.
+	 *
+	 * mac->id (0, 1, 2) != PSE port (1, 2, 15) — a lookup table is
+	 * required because GDM3's PSE port (15) is non-contiguous.
 	 */
-	if (conduit == eth->netdev[0])
-		pse_port = PSE_GDM1_PORT;
-	else if (conduit == eth->netdev[1])
-		pse_port = PSE_GDM2_PORT;
-	else if (conduit == eth->netdev[2])
-		pse_port = PSE_GDM3_PORT;
-	else
-		return -EOPNOTSUPP;
+	{
+		static const u8 gmac_to_pse[] = {
+			[MTK_GMAC1_ID] = PSE_GDM1_PORT,  /* 0 → 1  */
+			[MTK_GMAC2_ID] = PSE_GDM2_PORT,  /* 1 → 2  */
+			[MTK_GMAC3_ID] = PSE_GDM3_PORT,  /* 2 → 15 */
+		};
+		struct mtk_mac *mac = netdev_priv(conduit);
+
+		if (mac->id >= ARRAY_SIZE(gmac_to_pse))
+			return -EOPNOTSUPP;
+		pse_port = gmac_to_pse[mac->id];
+	}
 
 	/* Program DSA tag into etype/ib2 — clobbers ib2.DEST_PORT_V2. */
 	mtk_foe_entry_set_dsa(eth, foe, dsa_port_idx);
