@@ -112,6 +112,9 @@ static int mtk_mib_entry_read(struct mtk_ppe *ppe, u16 index, u64 *bytes, u64 *p
 	if (ret)
 		dev_warn_ratelimited(ppe->dev, "MIB cache flush timeout\n");
 
+	pr_info("PPE MIB idx=%u: CACHE_CTL after flush=0x%08x\n",
+		index, ppe_r32(ppe, MTK_PPE_MIB_CACHE_CTL));
+
 	val = FIELD_PREP(MTK_PPE_MIB_SER_CR_ADDR, index) | MTK_PPE_MIB_SER_CR_ST;
 	ppe_w32(ppe, MTK_PPE_MIB_SER_CR, val);
 
@@ -122,6 +125,9 @@ static int mtk_mib_entry_read(struct mtk_ppe *ppe, u16 index, u64 *bytes, u64 *p
 	cnt_r0 = readl(ppe->base + MTK_PPE_MIB_SER_R0);
 	cnt_r1 = readl(ppe->base + MTK_PPE_MIB_SER_R1);
 	cnt_r2 = readl(ppe->base + MTK_PPE_MIB_SER_R2);
+
+	pr_info("PPE MIB idx=%u: SER_R0=0x%08x R1=0x%08x R2=0x%08x\n",
+		index, cnt_r0, cnt_r1, cnt_r2);
 
 	if (mtk_is_netsys_v3_or_greater(ppe->eth)) {
 		/* 64 bit for each counter */
