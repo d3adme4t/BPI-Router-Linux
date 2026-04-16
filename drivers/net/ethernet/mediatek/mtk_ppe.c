@@ -98,11 +98,9 @@ static int mtk_mib_entry_read(struct mtk_ppe *ppe, u16 index, u64 *bytes, u64 *p
 	u32 val, cnt_r0, cnt_r1, cnt_r2;
 	int ret;
 
-	/* Flush MIB cache to commit accumulated counters to the MIB table.
-	 * Without this, the serial read interface returns zeros even for
-	 * active BIND entries. MTK_PPE_MIB_CACHE_CTL_FLUSH is a self-clearing
-	 * trigger bit — poll until it clears before issuing the serial read.
-	 */
+	pr_info("PPE MIB idx=%u: CACHE_CTL before flush=0x%08x\n",
+		index, ppe_r32(ppe, MTK_PPE_MIB_CACHE_CTL));
+
 	ppe_m32(ppe, MTK_PPE_MIB_CACHE_CTL, MTK_PPE_MIB_CACHE_CTL_FLUSH,
 		MTK_PPE_MIB_CACHE_CTL_FLUSH);
 
@@ -945,6 +943,9 @@ struct mtk_ppe *mtk_ppe_init(struct mtk_eth *eth, void __iomem *base, int index)
 					  &ppe->mib_phys, GFP_KERNEL);
 		if (!mib)
 			return NULL;
+
+		pr_info("PPE%d: MIB table allocated at %pad (size %u)\n",
+			index, &ppe->mib_phys, (u32)(MTK_PPE_ENTRIES * sizeof(*mib)));
 
 		ppe->mib_table = mib;
 
