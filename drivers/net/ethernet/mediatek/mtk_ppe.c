@@ -98,7 +98,7 @@ static int mtk_mib_entry_read(struct mtk_ppe *ppe, u16 index, u64 *bytes, u64 *p
 	u32 val, cnt_r0, cnt_r1, cnt_r2;
 	int ret;
 
-	pr_info("PPE MIB idx=%u: CACHE_CTL before flush=0x%08x\n",
+	pr_info("PPE MIB idx=%u: CACHE_CTL before=0x%08x\n",
 		index, ppe_r32(ppe, MTK_PPE_MIB_CACHE_CTL));
 
 	ppe_m32(ppe, MTK_PPE_MIB_CACHE_CTL, MTK_PPE_MIB_CACHE_CTL_FLUSH,
@@ -1091,6 +1091,12 @@ void mtk_ppe_start(struct mtk_ppe *ppe)
 		ppe_w32(ppe, MTK_PPE_SBW_CTRL, 0x7f);
 	}
 
+	/* Diagnostic: always print accounting state so we can confirm
+	 * mib_phys is non-zero even if the boot message was missing.
+	 */
+	pr_info("%s: accounting=%d mib_phys=%pad\n",
+		ppe->dirname, ppe->accounting, &ppe->mib_phys);
+
 	if (ppe->accounting && ppe->mib_phys) {
 		ppe_w32(ppe, MTK_PPE_MIB_TB_BASE, ppe->mib_phys);
 		ppe_m32(ppe, MTK_PPE_MIB_CFG, MTK_PPE_MIB_CFG_EN,
@@ -1099,6 +1105,11 @@ void mtk_ppe_start(struct mtk_ppe *ppe)
 			MTK_PPE_MIB_CFG_RD_CLR);
 		ppe_m32(ppe, MTK_PPE_MIB_CACHE_CTL, MTK_PPE_MIB_CACHE_CTL_EN,
 			MTK_PPE_MIB_CACHE_CTL_EN);
+		pr_info("%s: MIB setup TB_BASE=0x%08x (wrote %pad) CFG=0x%08x CACHE_CTL=0x%08x\n",
+			ppe->dirname,
+			ppe_r32(ppe, MTK_PPE_MIB_TB_BASE), &ppe->mib_phys,
+			ppe_r32(ppe, MTK_PPE_MIB_CFG),
+			ppe_r32(ppe, MTK_PPE_MIB_CACHE_CTL));
 	}
 }
 
